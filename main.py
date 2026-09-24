@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -18,10 +19,16 @@ from aiogram.types import Message, FSInputFile
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# Максимальный размер Lua-файла
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
+    raise RuntimeError(
+        "BOT_TOKEN environment variable is missing"
+    )
+
 
 # ============================================================
 # LOGGING
@@ -34,6 +41,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("lua-deobfuscator")
 
+
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -41,8 +49,9 @@ logger = logging.getLogger("lua-deobfuscator")
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+
 # ============================================================
-# HEALTH SERVER FOR RENDER
+# RENDER HTTP SERVER
 # ============================================================
 
 async def health(request):
@@ -54,10 +63,12 @@ async def health(request):
 
 async def start_web_server():
     app = web.Application()
+
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
 
     runner = web.AppRunner(app)
+
     await runner.setup()
 
     site = web.TCPSite(
@@ -68,10 +79,97 @@ async def start_web_server():
 
     await site.start()
 
-    logger.info("HTTP server started on port %s", PORT)
+    logger.info(
+        "HTTP server started on port %s",
+        PORT
+    )
+
 
 # ============================================================
-# LUA ANALYSIS
+# FILE READING
+# ============================================================
+
+def read_lua_file(path: Path) -> str:
+    """
+    Нормальное чтение Lua-файлов.
+
+    Пробуем:
+        UTF-8
+        UTF-8 BOM
+        UTF-16
+        CP1251
+        Latin-1
+
+    Код никогда не выполняется.
+    """
+
+    raw = path.read_bytes()
+
+    if not raw:
+        raise ValueError(
+            "Файл пустой."
+        )
+
+    encodings = [
+        "utf-8-sig",
+        "utf-8",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+        "cp1251",
+        "latin-1",
+    ]
+
+    best_text = None
+    best_score = -1
+
+    for encoding in encodings:
+
+        try:
+            text = raw.decode(encoding)
+
+        except UnicodeDecodeError:
+            continue
+
+        # Простейшая оценка качества декодирования.
+        bad = text.count("\ufffd")
+        nulls = text.count("\x00")
+
+        score = (
+            len(text)
+            - bad * 100
+            - nulls * 100
+        )
+
+        if score > best_score:
+            best_score = score
+            best_text = text
+
+    if best_text is None:
+        best_text = raw.decode(
+            "utf-8",
+            errors="replace"
+        )
+
+    # Убираем BOM
+    best_text = best_text.lstrip("\ufeff")
+
+    # Нормализуем окончания строк
+    best_text = best_text.replace(
+        "\r\n",
+        "\n"
+    )
+
+    best_text = best_text.replace(
+        "\r",
+        "\n"
+    )
+
+    return best_text
+
+
+# ============================================================
+# BASIC STATS
 # ============================================================
 
 def count_lines(code: str) -> int:
@@ -82,67 +180,87 @@ def count_lines(code: str) -> int:
 
 
 def analyze_code(code: str) -> dict:
+
     patterns = {
-        "string.char": r"\bstring\s*\.\s*char\s*\(",
-        "string.byte": r"\bstring\s*\.\s*byte\s*\(",
-        "string.reverse": r"\bstring\s*\.\s*reverse\s*\(",
-        "string.rep": r"\bstring\s*\.\s*rep\s*\(",
-        "loadstring": r"\bloadstring\s*\(",
-        "load": r"\bload\s*\(",
-        "table.concat": r"\btable\s*\.\s*concat\s*\(",
-        "getfenv": r"\bgetfenv\s*\(",
-        "setfenv": r"\bsetfenv\s*\(",
-        "escaped strings": r"\\\d{1,3}",
-        "hex escapes": r"\\x[0-9a-fA-F]{2}",
+        "string.char()":
+            r"\bstring\s*\.\s*char\s*\(",
+
+        "string.byte()":
+            r"\bstring\s*\.\s*byte\s*\(",
+
+        "string.reverse()":
+            r"\bstring\s*\.\s*reverse\s*\(",
+
+        "string.rep()":
+            r"\bstring\s*\.\s*rep\s*\(",
+
+        "loadstring()":
+            r"\bloadstring\s*\(",
+
+        "load()":
+            r"\bload\s*\(",
+
+        "table.concat()":
+            r"\btable\s*\.\s*concat\s*\(",
+
+        "getfenv()":
+            r"\bgetfenv\s*\(",
+
+        "setfenv()":
+            r"\bsetfenv\s*\(",
+
+        "decimal escapes":
+            r"\\\d{1,3}",
+
+        "hex escapes":
+            r"\\x[0-9a-fA-F]{2}",
     }
 
     result = {}
 
     for name, pattern in patterns.items():
-        result[name] = len(re.findall(pattern, code))
 
-    suspicious_words = [
+        result[name] = len(
+            re.findall(
+                pattern,
+                code
+            )
+        )
+
+    indicators = [
         "obfusc",
-        "encoded",
         "decode",
         "decrypt",
-        "xor",
+        "encoded",
+        "encrypt",
         "base64",
         "virtual",
         "vm",
+        "xor",
     ]
 
     lower = code.lower()
 
     result["possible indicators"] = sum(
-        lower.count(word)
-        for word in suspicious_words
+        lower.count(x)
+        for x in indicators
     )
 
     return result
 
 
 # ============================================================
-# SAFE STRING DECODERS
+# LUA STRING ESCAPES
 # ============================================================
 
 def decode_decimal_escapes(value: str) -> str:
-    """
-    Converts Lua decimal escapes such as:
-
-        "hello\\32world"
-
-    into:
-
-        "hello world"
-
-    Only works inside quoted strings.
-    """
 
     def repl(match):
+
         number = match.group(1)
 
         try:
+
             n = int(number)
 
             if 0 <= n <= 255:
@@ -153,23 +271,26 @@ def decode_decimal_escapes(value: str) -> str:
 
         return match.group(0)
 
-    return re.sub(r"\\([0-9]{1,3})", repl, value)
+    return re.sub(
+        r"\\([0-9]{1,3})",
+        repl,
+        value
+    )
 
 
 def decode_hex_escapes(value: str) -> str:
-    """
-    Converts Lua-style hexadecimal escapes:
-
-        \\x41
-
-    into:
-
-        A
-    """
 
     def repl(match):
+
         try:
-            return chr(int(match.group(1), 16))
+
+            return chr(
+                int(
+                    match.group(1),
+                    16
+                )
+            )
+
         except Exception:
             return match.group(0)
 
@@ -181,10 +302,6 @@ def decode_hex_escapes(value: str) -> str:
 
 
 def decode_common_escapes(value: str) -> str:
-    """
-    Decodes common Lua string escapes without touching
-    arbitrary source code.
-    """
 
     replacements = {
         r"\n": "\n",
@@ -197,37 +314,57 @@ def decode_common_escapes(value: str) -> str:
     }
 
     for old, new in replacements.items():
-        value = value.replace(old, new)
 
-    value = decode_decimal_escapes(value)
-    value = decode_hex_escapes(value)
+        value = value.replace(
+            old,
+            new
+        )
+
+    value = decode_decimal_escapes(
+        value
+    )
+
+    value = decode_hex_escapes(
+        value
+    )
 
     return value
 
 
-def decode_quoted_strings(code: str) -> str:
-    """
-    Finds normal Lua quoted strings and decodes safe escape
-    sequences.
+# ============================================================
+# QUOTED STRINGS
+# ============================================================
 
-    Does NOT execute Lua.
-    """
+def decode_quoted_strings(code: str) -> str:
 
     pattern = re.compile(
-        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+        r'"(?:\\.|[^"\\])*"'
+        r"|"
+        r"'(?:\\.|[^'\\])*'"
     )
 
     def repl(match):
+
         original = match.group(0)
 
         quote = original[0]
+
         content = original[1:-1]
 
-        decoded = decode_common_escapes(content)
+        decoded = decode_common_escapes(
+            content
+        )
 
-        return quote + decoded + quote
+        return (
+            quote
+            + decoded
+            + quote
+        )
 
-    return pattern.sub(repl, code)
+    return pattern.sub(
+        repl,
+        code
+    )
 
 
 # ============================================================
@@ -235,38 +372,39 @@ def decode_quoted_strings(code: str) -> str:
 # ============================================================
 
 def parse_number(value: str):
+
     value = value.strip()
 
     try:
-        if value.lower().startswith("0x"):
-            return int(value, 16)
 
-        return int(value, 10)
+        if value.lower().startswith("0x"):
+
+            return int(
+                value,
+                16
+            )
+
+        return int(
+            value,
+            10
+        )
 
     except Exception:
+
         return None
 
 
 def decode_string_char(code: str) -> str:
-    """
-    Converts simple:
-
-        string.char(72,101,108,108,111)
-
-    into:
-
-        "Hello"
-
-    Only numeric arguments are processed.
-    """
 
     pattern = re.compile(
-        r"string\s*\.\s*char\s*\(\s*"
+        r"string\s*\.\s*char"
+        r"\s*\(\s*"
         r"([0-9xa-fA-F,\s]+)"
         r"\)"
     )
 
     def repl(match):
+
         inside = match.group(1)
 
         parts = [
@@ -278,9 +416,15 @@ def decode_string_char(code: str) -> str:
         numbers = []
 
         for part in parts:
-            n = parse_number(part)
 
-            if n is None or not 0 <= n <= 255:
+            n = parse_number(
+                part
+            )
+
+            if n is None:
+                return match.group(0)
+
+            if not 0 <= n <= 255:
                 return match.group(0)
 
             numbers.append(n)
@@ -289,14 +433,36 @@ def decode_string_char(code: str) -> str:
             return match.group(0)
 
         try:
-            decoded = "".join(chr(x) for x in numbers)
 
-            return '"' + decoded.replace('"', '\\"') + '"'
+            decoded = "".join(
+                chr(x)
+                for x in numbers
+            )
+
+            decoded = decoded.replace(
+                "\\",
+                "\\\\"
+            )
+
+            decoded = decoded.replace(
+                '"',
+                '\\"'
+            )
+
+            return (
+                '"'
+                + decoded
+                + '"'
+            )
 
         except Exception:
+
             return match.group(0)
 
-    return pattern.sub(repl, code)
+    return pattern.sub(
+        repl,
+        code
+    )
 
 
 # ============================================================
@@ -304,157 +470,196 @@ def decode_string_char(code: str) -> str:
 # ============================================================
 
 def decode_string_reverse(code: str) -> str:
-    """
-    Converts:
-
-        string.reverse("abc")
-
-    into:
-
-        "cba"
-
-    Only literal strings are processed.
-    """
 
     pattern = re.compile(
-        r"string\s*\.\s*reverse\s*\(\s*"
-        r'(["\'])(.*?)\1\s*\)'
+        r'string\s*\.\s*reverse'
+        r'\s*\(\s*'
+        r'(["\'])'
+        r'(.*?)'
+        r'\1'
+        r'\s*\)'
     )
 
     def repl(match):
+
         quote = match.group(1)
+
         value = match.group(2)
 
-        return quote + value[::-1] + quote
+        return (
+            quote
+            + value[::-1]
+            + quote
+        )
 
-    return pattern.sub(repl, code)
+    return pattern.sub(
+        repl,
+        code
+    )
 
 
 # ============================================================
-# SIMPLE STRING CONCATENATION
+# SIMPLE STRING CONCAT
 # ============================================================
 
 def decode_simple_concat(code: str) -> str:
-    """
-    Converts simple constant concatenations:
-
-        "hel" .. "lo"
-
-    into:
-
-        "hello"
-
-    This intentionally avoids complex expressions.
-    """
 
     pattern = re.compile(
-        r'(["\'])([^"\']*)\1'
+        r'(["\'])'
+        r'([^"\']*)'
+        r'\1'
         r'\s*\.\.\s*'
-        r'(["\'])([^"\']*)\3'
+        r'(["\'])'
+        r'([^"\']*)'
+        r'\3'
     )
 
     changed = True
 
     while changed:
+
         new_code = pattern.sub(
             lambda m:
-            '"' + m.group(2) + m.group(4) + '"',
+                '"'
+                + m.group(2)
+                + m.group(4)
+                + '"',
             code
         )
 
-        changed = new_code != code
+        changed = (
+            new_code != code
+        )
+
         code = new_code
 
     return code
 
 
 # ============================================================
-# COMMENTS / FORMATTING
+# WHITESPACE
 # ============================================================
 
 def normalize_whitespace(code: str) -> str:
-    """
-    Light formatting only.
-    """
 
-    code = code.replace("\r\n", "\n")
-    code = code.replace("\r", "\n")
+    code = code.replace(
+        "\r\n",
+        "\n"
+    )
+
+    code = code.replace(
+        "\r",
+        "\n"
+    )
 
     lines = []
 
     for line in code.splitlines():
+
         line = line.rstrip()
 
-        if line.strip():
-            lines.append(line)
+        lines.append(
+            line
+        )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
+
+# ============================================================
+# BASIC LUA FORMATTER
+# ============================================================
 
 def basic_indent(code: str) -> str:
-    """
-    Lightweight Lua indentation.
-
-    This is intentionally conservative because Lua syntax
-    can be dynamically generated.
-    """
 
     lines = code.splitlines()
 
     result = []
+
     indent = 0
 
-    decrease_words = (
-        "end",
-        "until",
-        "else",
-        "elseif",
-    )
-
-    increase_words = (
-        "function",
-        "then",
-        "do",
-        "repeat",
-    )
-
     for line in lines:
+
         stripped = line.strip()
 
         if not stripped:
+
             result.append("")
+
             continue
 
         lower = stripped.lower()
 
-        if any(
-            lower.startswith(word)
-            for word in decrease_words
+        # Decrease indentation BEFORE output
+        if (
+            lower.startswith("end")
+            or lower.startswith("until")
+            or lower.startswith("else")
+            or lower.startswith("elseif")
         ):
-            indent = max(0, indent - 1)
+
+            indent = max(
+                0,
+                indent - 1
+            )
 
         result.append(
-            "    " * indent + stripped
+            "    " * indent
+            + stripped
         )
 
-        # Don't increase after comments
+        # Comments don't affect indentation
         if stripped.startswith("--"):
             continue
 
-        # elseif / else should restore indentation
-        if lower.startswith("else"):
+        # elseif / else
+        if (
+            lower.startswith("else")
+            or lower.startswith("elseif")
+        ):
+
             indent += 1
 
-        elif lower.endswith("then"):
+            continue
+
+        # then
+        if lower.endswith("then"):
+
             indent += 1
 
-        elif lower.endswith(" do"):
+            continue
+
+        # do
+        if (
+            lower.endswith(" do")
+            or lower == "do"
+        ):
+
             indent += 1
 
-        elif lower.startswith("function "):
+            continue
+
+        # repeat
+        if lower == "repeat":
+
             indent += 1
 
-    return "\n".join(result)
+            continue
+
+        # function
+        if (
+            lower.startswith("function ")
+            or lower.startswith("local function ")
+        ):
+
+            indent += 1
+
+            continue
+
+    return "\n".join(
+        result
+    )
 
 
 # ============================================================
@@ -462,367 +667,674 @@ def basic_indent(code: str) -> str:
 # ============================================================
 
 def deobfuscate(code: str):
-    original = code
 
     passes = []
 
-    # Pass 1
-    code = decode_quoted_strings(code)
+    # --------------------------------------------------------
+    # PASS 1
+    # --------------------------------------------------------
 
-    if code != original:
-        passes.append("decoded Lua string escapes")
-
-    # Pass 2
     old = code
-    code = decode_string_char(code)
+
+    code = decode_quoted_strings(
+        code
+    )
 
     if code != old:
-        passes.append("decoded string.char()")
 
-    # Pass 3
+        passes.append(
+            "decoded Lua string escapes"
+        )
+
+    # --------------------------------------------------------
+    # PASS 2
+    # --------------------------------------------------------
+
     old = code
-    code = decode_string_reverse(code)
+
+    code = decode_string_char(
+        code
+    )
 
     if code != old:
-        passes.append("decoded string.reverse()")
 
-    # Pass 4
+        passes.append(
+            "decoded string.char()"
+        )
+
+    # --------------------------------------------------------
+    # PASS 3
+    # --------------------------------------------------------
+
     old = code
-    code = decode_simple_concat(code)
+
+    code = decode_string_reverse(
+        code
+    )
 
     if code != old:
-        passes.append("merged constant string concatenations")
 
-    # Pass 5
-    code = normalize_whitespace()
+        passes.append(
+            "decoded string.reverse()"
+        )
 
-    # Pass 6
-    code = basic_indent(code)
+    # --------------------------------------------------------
+    # PASS 4
+    # --------------------------------------------------------
+
+    old = code
+
+    code = decode_simple_concat(
+        code
+    )
+
+    if code != old:
+
+        passes.append(
+            "merged constant string concatenations"
+        )
+
+    # --------------------------------------------------------
+    # PASS 5
+    # --------------------------------------------------------
+
+    old = code
+
+    code = normalize_whitespace(
+        code
+    )
+
+    if code != old:
+
+        passes.append(
+            "normalized whitespace"
+        )
+
+    # --------------------------------------------------------
+    # PASS 6
+    # --------------------------------------------------------
+
+    old = code
+
+    code = basic_indent(
+        code
+    )
+
+    if code != old:
+
+        passes.append(
+            "formatted Lua indentation"
+        )
 
     return code, passes
 
 
 # ============================================================
-# HTML GENERATOR
+# HTML
 # ============================================================
 
 def escape_code(code: str) -> str:
-    return html.escape(code, quote=False)
+
+    return html.escape(
+        code,
+        quote=False
+    )
 
 
 def create_html(
-    original: str,
-    result: str,
-    analysis: dict,
-    passes: list,
-    filename: str
-) -> str:
+    original,
+    result,
+    analysis,
+    passes,
+    filename
+):
 
-    original_lines = count_lines(original)
-    result_lines = count_lines(result)
+    original_lines = count_lines(
+        original
+    )
+
+    result_lines = count_lines(
+        result
+    )
+
+    original_size = len(
+        original.encode(
+            "utf-8"
+        )
+    )
+
+    result_size = len(
+        result.encode(
+            "utf-8"
+        )
+    )
+
+    stats = ""
+
+    stats += f"""
+    <div class="card">
+        <small>Исходных строк</small>
+        <b>{original_lines}</b>
+    </div>
+    """
+
+    stats += f"""
+    <div class="card">
+        <small>Результирующих строк</small>
+        <b>{result_lines}</b>
+    </div>
+    """
+
+    stats += f"""
+    <div class="card">
+        <small>Исходный размер</small>
+        <b>{original_size // 1024} KB</b>
+    </div>
+    """
+
+    stats += f"""
+    <div class="card">
+        <small>Результат</small>
+        <b>{result_size // 1024} KB</b>
+    </div>
+    """
 
     analysis_html = ""
 
     for key, value in analysis.items():
+
         analysis_html += f"""
-        <div class="stat">
-            <span>{html.escape(str(key))}</span>
-            <strong>{html.escape(str(value))}</strong>
+        <div class="analysis-item">
+            <span>
+                {html.escape(str(key))}
+            </span>
+
+            <strong>
+                {html.escape(str(value))}
+            </strong>
         </div>
         """
 
-    passes_html = ""
-
     if passes:
-        for item in passes:
-            passes_html += (
-                f"<li>{html.escape(item)}</li>"
-            )
+
+        passes_html = "".join(
+            f"<li>{html.escape(x)}</li>"
+            for x in passes
+        )
+
     else:
+
         passes_html = (
-            "<li>Автоматических преобразований не найдено</li>"
+            "<li>"
+            "Автоматических преобразований "
+            "не найдено."
+            "</li>"
         )
 
     return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
 
-<title>Lua Deobfuscator — {html.escape(filename)}</title>
+<html lang="ru">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>
+Lua Deobfuscator -
+{html.escape(filename)}
+</title>
 
 <style>
+
 * {{
     box-sizing: border-box;
 }}
 
 body {{
+
     margin: 0;
-    background: #080b12;
-    color: #e8edf7;
+
+    background:
+        #070a0f;
+
+    color:
+        #e9eef7;
+
     font-family:
-        Inter,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
+        Arial,
+        Helvetica,
         sans-serif;
 }}
 
 .container {{
-    width: min(1400px, 94%);
-    margin: 30px auto;
+
+    width:
+        min(1400px, 95%);
+
+    margin:
+        25px auto;
 }}
 
 .header {{
-    padding: 28px;
-    border: 1px solid #202838;
-    border-radius: 22px;
+
+    padding:
+        28px;
+
+    border:
+        1px solid #202938;
+
+    border-radius:
+        22px;
+
     background:
         linear-gradient(
             135deg,
             #111827,
-            #0b101a
+            #0b1018
         );
-    margin-bottom: 20px;
+
+    margin-bottom:
+        18px;
 }}
 
 .header h1 {{
-    margin: 0 0 8px;
-    font-size: 28px;
+
+    margin:
+        0 0 8px;
+
+    font-size:
+        28px;
 }}
 
 .header p {{
-    margin: 0;
-    color: #8d98aa;
+
+    margin:
+        0;
+
+    color:
+        #8d98a8;
 }}
 
-.grid {{
-    display: grid;
+.file {{
+
+    display:
+        inline-block;
+
+    margin-top:
+        14px;
+
+    padding:
+        7px 12px;
+
+    border-radius:
+        999px;
+
+    background:
+        #151d2a;
+
+    color:
+        #91a8ff;
+
+    font-size:
+        12px;
+}}
+
+.stats {{
+
+    display:
+        grid;
+
     grid-template-columns:
-        repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-    margin-bottom: 20px;
+        repeat(
+            auto-fit,
+            minmax(
+                180px,
+                1fr
+            )
+        );
+
+    gap:
+        12px;
+
+    margin-bottom:
+        18px;
 }}
 
-.stat {{
-    border: 1px solid #202838;
-    border-radius: 16px;
-    background: #0d121c;
-    padding: 17px;
+.card {{
+
+    padding:
+        18px;
+
+    background:
+        #0d121b;
+
+    border:
+        1px solid #202938;
+
+    border-radius:
+        17px;
 }}
 
-.stat span {{
-    display: block;
-    color: #8994a8;
-    font-size: 13px;
-    margin-bottom: 8px;
+.card small {{
+
+    display:
+        block;
+
+    color:
+        #818c9f;
+
+    margin-bottom:
+        8px;
 }}
 
-.stat strong {{
-    font-size: 22px;
+.card b {{
+
+    font-size:
+        22px;
 }}
 
 .panel {{
-    border: 1px solid #202838;
-    border-radius: 20px;
-    background: #0c111a;
-    overflow: hidden;
-    margin-bottom: 20px;
+
+    background:
+        #0b1018;
+
+    border:
+        1px solid #202938;
+
+    border-radius:
+        20px;
+
+    overflow:
+        hidden;
+
+    margin-bottom:
+        18px;
 }}
 
-.panel-title {{
-    padding: 16px 20px;
-    border-bottom: 1px solid #202838;
-    font-weight: 700;
+.title {{
+
+    padding:
+        16px 20px;
+
+    border-bottom:
+        1px solid #202938;
+
+    font-weight:
+        bold;
 }}
 
-pre {{
-    margin: 0;
-    padding: 22px;
-    overflow-x: auto;
-    font-family:
-        "JetBrains Mono",
-        "Fira Code",
-        Consolas,
-        monospace;
-    font-size: 13px;
-    line-height: 1.65;
-    color: #d8e0ef;
-    background: #070a10;
+.analysis {{
+
+    padding:
+        18px;
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(
+            auto-fit,
+            minmax(
+                220px,
+                1fr
+            )
+        );
+
+    gap:
+        10px;
+}}
+
+.analysis-item {{
+
+    display:
+        flex;
+
+    justify-content:
+        space-between;
+
+    padding:
+        12px;
+
+    border:
+        1px solid #1b2432;
+
+    border-radius:
+        12px;
+
+    background:
+        #0e141e;
+}}
+
+.analysis-item span {{
+
+    color:
+        #929daf;
 }}
 
 ol {{
-    margin: 0;
-    padding: 20px 45px;
-    color: #c8d1df;
+
+    margin:
+        0;
+
+    padding:
+        20px 45px;
+
+    color:
+        #cbd4e2;
+}}
+
+pre {{
+
+    margin:
+        0;
+
+    padding:
+        22px;
+
+    overflow-x:
+        auto;
+
+    background:
+        #06090e;
+
+    color:
+        #dce5f4;
+
+    font-family:
+        Consolas,
+        "Courier New",
+        monospace;
+
+    font-size:
+        13px;
+
+    line-height:
+        1.65;
+
+    tab-size:
+        4;
 }}
 
 .footer {{
-    text-align: center;
-    color: #667085;
-    font-size: 12px;
-    padding: 20px;
+
+    text-align:
+        center;
+
+    color:
+        #5f6a7b;
+
+    font-size:
+        12px;
+
+    padding:
+        15px;
 }}
 
-.badge {{
-    display: inline-block;
-    padding: 5px 10px;
-    border-radius: 999px;
-    background: #151d2b;
-    color: #8ea7ff;
-    font-size: 12px;
-    margin-top: 12px;
-}}
-
-@media(max-width:700px) {{
-    .container {{
-        width: 96%;
-        margin: 12px auto;
-    }}
-
-    .header {{
-        padding: 20px;
-    }}
-
-    pre {{
-        font-size: 12px;
-    }}
-}}
 </style>
+
 </head>
 
 <body>
 
 <div class="container">
 
-    <div class="header">
-        <h1>Lua Deobfuscator</h1>
+<div class="header">
 
-        <p>
-            Статический анализ и безопасное преобразование Lua-кода
-        </p>
+<h1>
+Lua Deobfuscator
+</h1>
 
-        <span class="badge">
-            {html.escape(filename)}
-        </span>
-    </div>
+<p>
+Статический анализ Lua-кода
+</p>
 
-    <div class="grid">
+<div class="file">
+{html.escape(filename)}
+</div>
 
-        <div class="stat">
-            <span>Исходных строк</span>
-            <strong>{original_lines}</strong>
-        </div>
+</div>
 
-        <div class="stat">
-            <span>Результирующих строк</span>
-            <strong>{result_lines}</strong>
-        </div>
 
-        <div class="stat">
-            <span>Размер исходника</span>
-            <strong>{len(original.encode("utf-8")) // 1024} KB</strong>
-        </div>
+<div class="stats">
 
-        <div class="stat">
-            <span>Размер результата</span>
-            <strong>{len(result.encode("utf-8")) // 1024} KB</strong>
-        </div>
+{stats}
 
-    </div>
+</div>
 
-    <div class="panel">
 
-        <div class="panel-title">
-            Выполненные преобразования
-        </div>
+<div class="panel">
 
-        <ol>
-            {passes_html}
-        </ol>
+<div class="title">
+Выполненные преобразования
+</div>
 
-    </div>
+<ol>
+{passes_html}
+</ol>
 
-    <div class="panel">
+</div>
 
-        <div class="panel-title">
-            Анализ
-        </div>
 
-        <div style="padding:20px">
-            <div class="grid">
-                {analysis_html}
-            </div>
-        </div>
+<div class="panel">
 
-    </div>
+<div class="title">
+Анализ кода
+</div>
 
-    <div class="panel">
+<div class="analysis">
 
-        <div class="panel-title">
-            Деобфусцированный код
-        </div>
+{analysis_html}
 
-        <pre>{escape_code(result)}</pre>
+</div>
 
-    </div>
+</div>
 
-    <div class="panel">
 
-        <div class="panel-title">
-            Исходный код
-        </div>
+<div class="panel">
 
-        <pre>{escape_code(original)}</pre>
+<div class="title">
+Деобфусцированный код
+</div>
 
-    </div>
+<pre>
+{escape_code(result)}
+</pre>
 
-    <div class="footer">
-        Lua Deobfuscator • Static analysis only
-    </div>
+</div>
+
+
+<div class="panel">
+
+<div class="title">
+Исходный код
+</div>
+
+<pre>
+{escape_code(original)}
+</pre>
+
+</div>
+
+
+<div class="footer">
+
+Lua Deobfuscator
+•
+Static analysis only
+
+</div>
 
 </div>
 
 </body>
+
 </html>
 """
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# /START
 # ============================================================
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def start_command(
+    message: Message
+):
+
     await message.answer(
         "👋 Привет!\n\n"
+
         "Я Lua Deobfuscator.\n\n"
-        "Отправь мне файл:\n"
-        "• .lua\n"
-        "• .txt\n\n"
-        "Я выполню статический анализ, "
-        "попробую разобрать распространённые "
-        "слои обфускации и верну HTML-файл "
-        "с результатом.\n\n"
-        "⚠️ Загруженный Lua-код не выполняется."
+
+        "📄 Отправь мне Lua-файл "
+        "в формате .lua или .txt.\n\n"
+
+        "Я:\n"
+        "🔎 прочитаю файл;\n"
+        "🧩 проанализирую код;\n"
+        "🧹 попробую убрать простые "
+        "слои обфускации;\n"
+        "🌐 создам HTML;\n"
+        "📎 отправлю результат.\n\n"
+
+        "⚠️ Загруженный Lua-код "
+        "не выполняется."
     )
 
 
+# ============================================================
+# /HELP
+# ============================================================
+
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
+async def help_command(
+    message: Message
+):
+
     await message.answer(
-        "📖 Поддерживаются:\n\n"
-        "• Lua .lua\n"
-        "• Lua .txt\n"
+        "📖 Поддержка:\n\n"
+
+        "• .lua\n"
+        "• .txt\n"
+        "• UTF-8\n"
+        "• UTF-8 BOM\n"
+        "• UTF-16\n"
+        "• CP1251\n\n"
+
+        "Обработка:\n"
         "• string.char()\n"
-        "• Lua decimal escapes\n"
-        "• hexadecimal escapes\n"
         "• string.reverse()\n"
-        "• простые конкатенации строк\n"
-        "• базовое форматирование\n"
-        "• статистика и анализ\n\n"
-        "Максимальный размер файла: 5 MB."
+        "• decimal escapes\n"
+        "• hex escapes\n"
+        "• простая конкатенация строк\n"
+        "• форматирование Lua\n"
+        "• анализ признаков обфускации\n\n"
+
+        f"Максимальный размер: "
+        f"{MAX_FILE_SIZE // 1024 // 1024} MB."
     )
 
 
@@ -831,35 +1343,72 @@ async def cmd_help(message: Message):
 # ============================================================
 
 @dp.message(F.document)
-async def receive_file(message: Message):
+async def receive_file(
+    message: Message
+):
 
     document = message.document
 
     if not document:
         return
 
-    filename = document.file_name or "script.lua"
+    filename = (
+        document.file_name
+        or "script.lua"
+    )
 
-    extension = Path(filename).suffix.lower()
+    extension = (
+        Path(filename)
+        .suffix
+        .lower()
+    )
 
-    if extension not in {".lua", ".txt"}:
+    # --------------------------------------------------------
+    # EXTENSION
+    # --------------------------------------------------------
+
+    if extension not in {
+        ".lua",
+        ".txt"
+    }:
+
         await message.answer(
-            "❌ Нужен файл .lua или .txt"
+            "❌ Поддерживаются только "
+            ".lua и .txt"
         )
+
         return
 
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
+    # --------------------------------------------------------
+    # SIZE
+    # --------------------------------------------------------
+
+    if (
+        document.file_size
+        and
+        document.file_size
+        > MAX_FILE_SIZE
+    ):
+
         await message.answer(
-            "❌ Файл слишком большой.\n"
-            "Максимальный размер — 5 MB."
+            "❌ Файл слишком большой.\n\n"
+            f"Максимум: "
+            f"{MAX_FILE_SIZE // 1024 // 1024} MB."
         )
+
         return
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
 
     status = await message.answer(
         "📥 Получаю файл..."
     )
 
-    temp_dir = Path(tempfile.gettempdir())
+    temp_dir = Path(
+        tempfile.gettempdir()
+    )
 
     safe_name = re.sub(
         r"[^a-zA-Z0-9_.-]",
@@ -867,72 +1416,159 @@ async def receive_file(message: Message):
         filename
     )
 
-    input_path = temp_dir / (
-        f"lua_input_{message.from_user.id}_{safe_name}"
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else 0
     )
 
-    output_path = temp_dir / (
-        f"lua_result_{message.from_user.id}.html"
+    input_path = (
+        temp_dir
+        /
+        f"lua_{user_id}_{safe_name}"
+    )
+
+    output_path = (
+        temp_dir
+        /
+        f"lua_result_{user_id}.html"
     )
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # DOWNLOAD
-        # ----------------------------------------------------
+        # ====================================================
 
-        telegram_file = await bot.get_file(
-            document.file_id
+        logger.info(
+            "Receiving file: %s",
+            filename
         )
+
+        telegram_file = (
+            await bot.get_file(
+                document.file_id
+            )
+        )
+
+        if not telegram_file.file_path:
+
+            raise RuntimeError(
+                "Telegram не вернул "
+                "путь к файлу."
+            )
 
         await bot.download_file(
             telegram_file.file_path,
-            destination=input_path
+            destination=str(
+                input_path
+            )
         )
 
-        await status.edit_text(
-            "🔍 Анализирую Lua-код..."
+        # ====================================================
+        # VERIFY
+        # ====================================================
+
+        if not input_path.exists():
+
+            raise RuntimeError(
+                "Файл не был скачан."
+            )
+
+        actual_size = (
+            input_path.stat()
+            .st_size
         )
 
-        # ----------------------------------------------------
-        # READ
-        # ----------------------------------------------------
+        logger.info(
+            "Downloaded %s bytes",
+            actual_size
+        )
 
-        raw = input_path.read_bytes()
+        if actual_size == 0:
 
-        if len(raw) > MAX_FILE_SIZE:
             raise ValueError(
-                "File is larger than allowed size"
+                "Файл пустой."
             )
 
-        # Try UTF-8 first
-        try:
-            source = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            source = raw.decode(
-                "utf-8",
-                errors="replace"
+        if actual_size > MAX_FILE_SIZE:
+
+            raise ValueError(
+                "Файл превышает лимит."
             )
 
-        # ----------------------------------------------------
-        # ANALYZE
-        # ----------------------------------------------------
-
-        analysis = analyze_code(source)
+        # ====================================================
+        # READ
+        # ====================================================
 
         await status.edit_text(
-            "🧩 Выполняю преобразования..."
+            "📖 Читаю Lua-файл..."
         )
 
-        # ----------------------------------------------------
-        # DEOBFUSCATE
-        # ----------------------------------------------------
+        source = read_lua_file(
+            input_path
+        )
 
-        result, passes = deobfuscate(source)
+        logger.info(
+            "Read Lua source: %s chars",
+            len(source)
+        )
 
-        # ----------------------------------------------------
+        if not source.strip():
+
+            raise ValueError(
+                "После чтения файл оказался пустым."
+            )
+
+        # ====================================================
+        # ANALYSIS
+        # ====================================================
+
+        await status.edit_text(
+            "🔎 Анализирую код..."
+        )
+
+        analysis = analyze_code(
+            source
+        )
+
+        logger.info(
+            "Analysis: %s",
+            analysis
+        )
+
+        # ====================================================
+        # DEOBFUSCATION
+        # ====================================================
+
+        await status.edit_text(
+            "🧩 Выполняю деобфускацию..."
+        )
+
+        result, passes = (
+            deobfuscate(
+                source
+            )
+        )
+
+        logger.info(
+            "Deobfuscation passes: %s",
+            passes
+        )
+
+        if not result:
+
+            raise RuntimeError(
+                "Результат деобфускации пуст."
+            )
+
+        # ====================================================
         # HTML
-        # ----------------------------------------------------
+        # ====================================================
+
+        await status.edit_text(
+            "🌐 Создаю HTML-файл..."
+        )
 
         html_content = create_html(
             original=source,
@@ -947,70 +1583,130 @@ async def receive_file(message: Message):
             encoding="utf-8"
         )
 
-        # ----------------------------------------------------
+        if not output_path.exists():
+
+            raise RuntimeError(
+                "HTML-файл не создан."
+            )
+
+        # ====================================================
         # SEND
-        # ----------------------------------------------------
+        # ====================================================
 
         await status.edit_text(
-            "✅ Готово! Отправляю результат..."
+            "📤 Отправляю результат..."
         )
 
         result_file = FSInputFile(
-            output_path,
-            filename=f"{Path(filename).stem}_deobfuscated.html"
+            path=str(
+                output_path
+            ),
+            filename=(
+                f"{Path(filename).stem}"
+                f"_deobfuscated.html"
+            )
         )
 
         await message.answer_document(
-            result_file,
+            document=result_file,
             caption=(
-                "✅ Анализ завершён\n\n"
+                "✅ Готово!\n\n"
+
                 f"📄 Файл: {filename}\n"
-                f"📏 Строк: {count_lines(source)}\n"
-                f"🧩 Преобразований: {len(passes)}\n\n"
-                "⚠️ Результат получен статическим "
-                "анализом. Lua-код не выполнялся."
+                f"📏 Строк: "
+                f"{count_lines(source)}\n"
+                f"🧩 Преобразований: "
+                f"{len(passes)}\n\n"
+
+                "⚠️ Код не выполнялся."
             )
         )
 
         await status.delete()
 
+        logger.info(
+            "Successfully processed: %s",
+            filename
+        )
+
     except Exception as e:
 
         logger.exception(
-            "Error processing file: %s",
-            e
+            "PROCESSING ERROR: %s",
+            filename
         )
 
-        await status.edit_text(
-            "❌ Не удалось обработать файл.\n\n"
-            "Попробуй другой Lua-файл."
-        )
+        error = str(e).strip()
+
+        if not error:
+            error = type(e).__name__
+
+        error = error[:1000]
+
+        try:
+
+            await status.edit_text(
+                "❌ Не удалось обработать файл.\n\n"
+                f"Тип ошибки: "
+                f"{type(e).__name__}\n\n"
+                f"Причина:\n"
+                f"{error}\n\n"
+                "Подробности находятся "
+                "в Render Logs."
+            )
+
+        except Exception:
+
+            await message.answer(
+                "❌ Ошибка обработки:\n\n"
+                f"{error}"
+            )
 
     finally:
 
-        try:
-            if input_path.exists():
-                input_path.unlink()
-        except Exception:
-            pass
+        # ====================================================
+        # DELETE TEMP FILES
+        # ====================================================
 
         try:
+
+            if input_path.exists():
+                input_path.unlink()
+
+        except Exception as e:
+
+            logger.warning(
+                "Input cleanup failed: %s",
+                e
+            )
+
+        try:
+
             if output_path.exists():
                 output_path.unlink()
-        except Exception:
-            pass
+
+        except Exception as e:
+
+            logger.warning(
+                "Output cleanup failed: %s",
+                e
+            )
 
 
 # ============================================================
-# FALLBACK
+# OTHER MESSAGES
 # ============================================================
 
 @dp.message()
-async def fallback(message: Message):
+async def other_message(
+    message: Message
+):
 
     await message.answer(
-        "📄 Отправь мне Lua-файл как документ.\n\n"
-        "Поддерживаются .lua и .txt."
+        "📄 Отправь Lua-файл как документ.\n\n"
+        "Поддерживаются:\n"
+        "• .lua\n"
+        "• .txt"
     )
 
 
@@ -1020,7 +1716,9 @@ async def fallback(message: Message):
 
 async def main():
 
-    logger.info("Starting Lua Deobfuscator Bot")
+    logger.info(
+        "Starting Lua Deobfuscator..."
+    )
 
     await start_web_server()
 
@@ -1028,13 +1726,35 @@ async def main():
         drop_pending_updates=True
     )
 
-    logger.info("Bot polling started")
+    logger.info(
+        "Telegram polling started"
+    )
 
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot
+    )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
+
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
+
     except KeyboardInterrupt:
-        logger.info("Bot stopped")
+
+        logger.info(
+            "Bot stopped"
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Fatal application error"
+        )
