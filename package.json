@@ -1,7 +1,7 @@
 {
-  "name": "telegram-render-bot",
+  "name": "email-verification-bot",
   "version": "1.0.0",
-  "private": true,
+  "description": "Telegram email verification bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
