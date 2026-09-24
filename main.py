@@ -1,44 +1,13 @@
-# main.py
-# Advanced Lua Static Deobfuscator
-# Does NOT execute uploaded Lua code.
-#
-# Supports many static transformations:
-# - decimal / hex / octal / binary escapes
-# - string.char / string.byte
-# - string.reverse
-# - string.rep
-# - string.lower / upper
-# - string.sub
-# - string.format for constants
-# - table.concat
-# - table.insert
-# - arithmetic constant folding
-# - boolean folding
-# - comparisons
-# - concatenation
-# - local constant propagation
-# - table constant propagation
-# - aliases
-# - dead constant cleanup
-# - duplicate parentheses
-# - redundant tostring / tonumber
-# - nested constant expressions
-# - escaped strings
-# - generated variable cleanup
-# - comments
-# - whitespace normalization
-# - indentation
-# - HTML report
-#
-# pip install aiogram aiohttp
-
 import os
 import re
+import ast
 import html
 import asyncio
 import logging
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -55,7 +24,7 @@ PORT = int(os.getenv("PORT", "10000"))
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not configured")
+    raise RuntimeError("BOT_TOKEN is missing")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,99 +36,125 @@ dp = Dispatcher()
 
 
 # ============================================================
-# SAFE LEXICAL UTILITIES
+# VALUES
 # ============================================================
 
-IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+@dataclass
+class Unknown:
+    reason: str = ""
 
-NUMBER_RE = re.compile(
-    r"""
-    (?<![\w.])
-    (
-        0[xX][0-9A-Fa-f]+
-        |
-        0[bB][01]+
-        |
-        0[oO][0-7]+
-        |
-        \d+(?:\.\d+)?
-    )
-    (?![\w.])
-    """,
-    re.X
-)
+    def __bool__(self):
+        return False
 
-STRING_RE = re.compile(
-    r"""
-    (
-        "(?:\\.|[^"\\])*"
-        |
-        '(?:\\.|[^'\\])*'
-    )
-    """,
-    re.X
-)
+
+UNKNOWN = Unknown()
+
+
+@dataclass
+class LuaFunction:
+    params: list
+    body: str
+    return_expr: Optional[str] = None
+
+
+@dataclass
+class LuaTable:
+    items: dict
+
+    def get(self, key, default=UNKNOWN):
+        return self.items.get(key, default)
+
+    def set(self, key, value):
+        self.items[key] = value
+
+    def length(self):
+        n = 0
+
+        while (n + 1) in self.items:
+            n += 1
+
+        return n
+
+
+# ============================================================
+# BASIC VALUE HELPERS
+# ============================================================
+
+def is_unknown(v):
+    return isinstance(v, Unknown)
+
+
+def lua_bool(v):
+    if v is None:
+        return False
+
+    if v is False:
+        return False
+
+    return True
+
+
+def lua_tostring(v):
+    if isinstance(v, str):
+        return v
+
+    if v is True:
+        return "true"
+
+    if v is False:
+        return "false"
+
+    if v is None:
+        return "nil"
+
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+
+    if isinstance(v, (int, float)):
+        return str(v)
+
+    return str(v)
 
 
 def lua_quote(value):
-    value = str(value)
-    value = value.replace("\\", "\\\\")
-    value = value.replace('"', '\\"')
-    value = value.replace("\r", "\\r")
-    value = value.replace("\n", "\\n")
-    value = value.replace("\t", "\\t")
+    if not isinstance(value, str):
+        value = lua_tostring(value)
+
+    value = (
+        value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\0", "\\0")
+    )
+
     return '"' + value + '"'
 
 
-def strip_quotes(s):
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
-        return s[1:-1]
-    return s
-
-
-def is_string_literal(s):
-    s = s.strip()
-    return (
-        len(s) >= 2
-        and s[0] == s[-1]
-        and s[0] in "\"'"
-    )
-
-
-def is_number_literal(s):
-    return bool(NUMBER_RE.fullmatch(s.strip()))
-
-
-def parse_number(s):
-    s = s.strip()
-
-    try:
-        if re.fullmatch(r"0[xX][0-9A-Fa-f]+", s):
-            return int(s, 16)
-
-        if re.fullmatch(r"0[bB][01]+", s):
-            return int(s, 2)
-
-        if re.fullmatch(r"0[oO][0-7]+", s):
-            return int(s, 8)
-
-        if "." in s:
-            return float(s)
-
-        return int(s)
-    except Exception:
-        return None
-
-
 # ============================================================
-# LUA STRING DECODER
+# STRING DECODER
 # ============================================================
 
-def decode_lua_escape_sequence(text):
+def decode_lua_string(token):
+    token = token.strip()
+
+    if len(token) < 2:
+        return UNKNOWN
+
+    if token[0] not in "\"'":
+        return UNKNOWN
+
+    if token[-1] != token[0]:
+        return UNKNOWN
+
+    raw = token[1:-1]
+
     out = []
     i = 0
 
-    simple = {
+    escapes = {
         "a": "\a",
         "b": "\b",
         "f": "\f",
@@ -172,58 +167,55 @@ def decode_lua_escape_sequence(text):
         "'": "'",
     }
 
-    while i < len(text):
-        if text[i] != "\\":
-            out.append(text[i])
+    while i < len(raw):
+        if raw[i] != "\\":
+            out.append(raw[i])
             i += 1
             continue
 
-        if i + 1 >= len(text):
+        if i + 1 >= len(raw):
             out.append("\\")
             break
 
-        c = text[i + 1]
+        c = raw[i + 1]
 
-        if c in simple:
-            out.append(simple[c])
+        if c in escapes:
+            out.append(escapes[c])
             i += 2
             continue
 
-        # decimal escape
-        m = re.match(r"\\([0-9]{1,3})", text[i:])
+        m = re.match(r"[0-9]{1,3}", raw[i + 1:])
+
         if m:
             try:
-                out.append(chr(int(m.group(1), 10)))
-                i += len(m.group(0))
+                out.append(chr(int(m.group(0)) & 255))
+                i += 1 + len(m.group(0))
                 continue
             except Exception:
                 pass
 
-        # hex escape
-        m = re.match(r"\\x([0-9A-Fa-f]{2})", text[i:])
-        if m:
+        if c == "x" and i + 3 < len(raw):
+            h = raw[i + 2:i + 4]
+
             try:
-                out.append(chr(int(m.group(1), 16)))
-                i += len(m.group(0))
+                out.append(chr(int(h, 16)))
+                i += 4
                 continue
             except Exception:
                 pass
 
-        # unicode-like Lua escape
-        m = re.match(r"\\u\{([0-9A-Fa-f]+)\}", text[i:])
-        if m:
-            try:
-                out.append(chr(int(m.group(1), 16)))
-                i += len(m.group(0))
-                continue
-            except Exception:
-                pass
+        if c == "u" and i + 2 < len(raw) and raw[i + 2] == "{":
+            end = raw.find("}", i + 3)
 
-        # escaped newline
-        if c == "\n":
-            i += 2
-            out.append("\n")
-            continue
+            if end != -1:
+                try:
+                    out.append(
+                        chr(int(raw[i + 3:end], 16))
+                    )
+                    i = end + 1
+                    continue
+                except Exception:
+                    pass
 
         out.append(c)
         i += 2
@@ -231,77 +223,81 @@ def decode_lua_escape_sequence(text):
     return "".join(out)
 
 
-def decode_string_literal(token):
-    if not is_string_literal(token):
-        return None
-
-    raw = strip_quotes(token)
-
-    try:
-        return decode_lua_escape_sequence(raw)
-    except Exception:
-        return None
-
-
 # ============================================================
-# COMMENT REMOVAL
+# TOKENIZER
 # ============================================================
 
-def remove_comments(code):
-    # Long comments
-    code = re.sub(
-        r"--\[(=*)\[.*?\]\1\]",
-        "",
-        code,
-        flags=re.S
+@dataclass
+class Token:
+    value: str
+    kind: str
+
+
+TOKEN_RE = re.compile(
+    r"""
+    (?P<WS>\s+)
+    |
+    (?P<COMMENT>--[^\n]*)
+    |
+    (?P<LONGCOMMENT>--\[(=*)\[.*?\]\1\])
+    |
+    (?P<STRING>
+        "(?:\\.|[^"\\])*"
+        |
+        '(?:\\.|[^'\\])*'
     )
+    |
+    (?P<NUMBER>
+        0[xX][0-9A-Fa-f]+
+        |
+        0[bB][01]+
+        |
+        0[oO][0-7]+
+        |
+        \d+(?:\.\d+)?
+    )
+    |
+    (?P<ID>[A-Za-z_][A-Za-z0-9_]*)
+    |
+    (?P<OP>
+        \.\.
+        |
+        ==|~=|<=|>=
+        |
+        \+=|-=|\*=|/=
+        |
+        \.\.\.
+        |
+        [+\-*/%^#=<>.,:{}()\[\];]
+    )
+    """,
+    re.X | re.S
+)
 
-    # Single line comments, avoiding strings
+
+def tokenize(code):
+    tokens = []
+
+    for m in TOKEN_RE.finditer(code):
+        kind = m.lastgroup
+        value = m.group(0)
+
+        if kind in {"WS", "COMMENT", "LONGCOMMENT"}:
+            continue
+
+        tokens.append(
+            Token(value, kind)
+        )
+
+    return tokens
+
+
+# ============================================================
+# TOP LEVEL SCANNER
+# ============================================================
+
+def split_top_level(text, delimiter=","):
     result = []
-    i = 0
-    quote = None
-
-    while i < len(code):
-        c = code[i]
-
-        if quote:
-            result.append(c)
-
-            if c == "\\" and i + 1 < len(code):
-                result.append(code[i + 1])
-                i += 2
-                continue
-
-            if c == quote:
-                quote = None
-
-            i += 1
-            continue
-
-        if c in "\"'":
-            quote = c
-            result.append(c)
-            i += 1
-            continue
-
-        if c == "-" and i + 1 < len(code) and code[i + 1] == "-":
-            while i < len(code) and code[i] != "\n":
-                i += 1
-            result.append("\n")
-            continue
-
-        result.append(c)
-        i += 1
-
-    return "".join(result)
-
-
-# ============================================================
-# TOP LEVEL SPLITTER
-# ============================================================
-
-def split_top_level(text, separator=","):
-    parts = []
     start = 0
     depth = 0
     quote = None
@@ -332,14 +328,58 @@ def split_top_level(text, separator=","):
         elif c in ")]}":
             depth -= 1
 
-        elif c == separator and depth == 0:
-            parts.append(text[start:i].strip())
+        elif c == delimiter and depth == 0:
+            result.append(
+                text[start:i].strip()
+            )
             start = i + 1
 
         i += 1
 
-    parts.append(text[start:].strip())
-    return parts
+    tail = text[start:].strip()
+
+    if tail:
+        result.append(tail)
+
+    return result
+
+
+def find_matching(text, start, opening="(", closing=")"):
+    depth = 0
+    quote = None
+    i = start
+
+    while i < len(text):
+        c = text[i]
+
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+
+            if c == quote:
+                quote = None
+
+            i += 1
+            continue
+
+        if c in "\"'":
+            quote = c
+            i += 1
+            continue
+
+        if c == opening:
+            depth += 1
+
+        elif c == closing:
+            depth -= 1
+
+            if depth == 0:
+                return i
+
+        i += 1
+
+    return -1
 
 
 def split_binary(text, operator):
@@ -377,7 +417,10 @@ def split_binary(text, operator):
             continue
 
         if depth == 0 and text.startswith(operator, i):
-            return text[:i].strip(), text[i + len(operator):].strip()
+            return (
+                text[:i].strip(),
+                text[i + len(operator):].strip()
+            )
 
         i += 1
 
@@ -385,43 +428,76 @@ def split_binary(text, operator):
 
 
 # ============================================================
-# SAFE CONSTANT EVALUATOR
+# STATIC LUA EVALUATOR
 # ============================================================
 
-class Evaluator:
-    def __init__(self, constants=None, tables=None):
-        self.constants = constants or {}
-        self.tables = tables or {}
+class StaticLua:
+    def __init__(self):
+        self.env = {}
+        self.functions = {}
+        self.tables = {}
+        self.output_aliases = {}
+        self.depth = 0
 
-    def eval(self, expr):
+    # --------------------------------------------------------
+    # MAIN EXPRESSION EVALUATOR
+    # --------------------------------------------------------
+
+    def eval(self, expr, local_env=None):
+        if self.depth > 80:
+            return UNKNOWN
+
         expr = expr.strip()
 
         if not expr:
-            return None
+            return UNKNOWN
 
-        # Remove unnecessary outer parentheses
+        if local_env is None:
+            local_env = self.env
+
+        self.depth += 1
+
+        try:
+            return self._eval(expr, local_env)
+        finally:
+            self.depth -= 1
+
+    def _eval(self, expr, env):
+        # ----------------------------------------------------
+        # Outer parentheses
+        # ----------------------------------------------------
+
         while (
-            len(expr) >= 2
-            and expr[0] == "("
-            and expr[-1] == ")"
+            expr.startswith("(")
+            and expr.endswith(")")
+            and find_matching(expr, 0) == len(expr) - 1
         ):
-            inner = expr[1:-1].strip()
+            expr = expr[1:-1].strip()
 
-            if self.balanced(inner):
-                expr = inner
-            else:
-                break
+        # ----------------------------------------------------
+        # Strings
+        # ----------------------------------------------------
 
-        # Literal string
-        if is_string_literal(expr):
-            return decode_string_literal(expr)
+        if (
+            len(expr) >= 2
+            and expr[0] in "\"'"
+            and expr[-1] == expr[0]
+        ):
+            return decode_lua_string(expr)
 
-        # Number
-        n = parse_number(expr)
+        # ----------------------------------------------------
+        # Numbers
+        # ----------------------------------------------------
+
+        n = self.parse_number(expr)
+
         if n is not None:
             return n
 
-        # Boolean
+        # ----------------------------------------------------
+        # Booleans / nil
+        # ----------------------------------------------------
+
         if expr == "true":
             return True
 
@@ -431,362 +507,340 @@ class Evaluator:
         if expr == "nil":
             return None
 
-        # Known constant
-        if expr in self.constants:
-            return self.constants[expr]
+        # ----------------------------------------------------
+        # Variable
+        # ----------------------------------------------------
 
-        # Table indexed access
-        m = re.fullmatch(
-            rf"({IDENT})\s*\[\s*(\d+)\s*\]",
+        if re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*",
             expr
-        )
+        ):
+            if expr in env:
+                return env[expr]
 
-        if m:
-            table_name = m.group(1)
-            index = int(m.group(2))
+            if expr in self.env:
+                return self.env[expr]
 
-            if table_name in self.tables:
-                table = self.tables[table_name]
+            return UNKNOWN
 
-                if index in table:
-                    return table[index]
+        # ----------------------------------------------------
+        # Table literal
+        # ----------------------------------------------------
 
-        # #table
-        m = re.fullmatch(
-            rf"#\s*({IDENT})",
-            expr
-        )
+        if expr.startswith("{") and expr.endswith("}"):
+            return self.eval_table(
+                expr[1:-1],
+                env
+            )
 
-        if m and m.group(1) in self.tables:
-            return len(self.tables[m.group(1)])
+        # ----------------------------------------------------
+        # Length
+        # ----------------------------------------------------
 
-        # tonumber
-        m = re.fullmatch(
-            r"tonumber\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
+        if expr.startswith("#"):
+            value = self.eval(
+                expr[1:].strip(),
+                env
+            )
 
-        if m:
-            value = self.eval(m.group(1))
-
-            if isinstance(value, (int, float)):
-                return value
-
-            if isinstance(value, str):
-                try:
-                    return int(value)
-                except Exception:
-                    try:
-                        return float(value)
-                    except Exception:
-                        pass
-
-        # tostring
-        m = re.fullmatch(
-            r"tostring\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
-
-            if value is not None:
-                if value is True:
-                    return "true"
-                if value is False:
-                    return "false"
-                return str(value)
-
-        # string.char
-        m = re.fullmatch(
-            r"string\s*\.\s*char\s*\((.*)\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            args = split_top_level(m.group(1))
-            chars = []
-
-            for arg in args:
-                value = self.eval(arg)
-
-                if not isinstance(value, (int, float)):
-                    return None
-
-                try:
-                    chars.append(chr(int(value) % 256))
-                except Exception:
-                    return None
-
-            return "".join(chars)
-
-        # string.byte
-        m = re.fullmatch(
-            r"string\s*\.\s*byte\s*\(\s*(.*?)(?:\s*,\s*(.*?))?\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
-
-            if not isinstance(value, str) or not value:
-                return None
-
-            start = 1
-
-            if m.group(2):
-                pos = self.eval(m.group(2))
-                if isinstance(pos, (int, float)):
-                    start = int(pos)
-
-            if 1 <= start <= len(value):
-                return ord(value[start - 1])
-
-            return None
-
-        # string.reverse
-        m = re.fullmatch(
-            r"string\s*\.\s*reverse\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
-
-            if isinstance(value, str):
-                return value[::-1]
-
-        # string.lower
-        m = re.fullmatch(
-            r"string\s*\.\s*lower\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
-
-            if isinstance(value, str):
-                return value.lower()
-
-        # string.upper
-        m = re.fullmatch(
-            r"string\s*\.\s*upper\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
-
-            if isinstance(value, str):
-                return value.upper()
-
-        # string.len
-        m = re.fullmatch(
-            r"string\s*\.\s*len\s*\(\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            value = self.eval(m.group(1))
+            if isinstance(value, LuaTable):
+                return value.length()
 
             if isinstance(value, str):
                 return len(value)
 
-        # string.rep
-        m = re.fullmatch(
-            r"string\s*\.\s*rep\s*\(\s*(.*?)\s*,\s*(.*?)\s*\)",
-            expr,
-            re.S
-        )
+            return UNKNOWN
 
-        if m:
-            a = self.eval(m.group(1))
-            b = self.eval(m.group(2))
+        # ----------------------------------------------------
+        # Unary not
+        # ----------------------------------------------------
 
-            if isinstance(a, str) and isinstance(b, (int, float)):
-                return a * int(b)
+        if expr.startswith("not "):
+            value = self.eval(
+                expr[4:],
+                env
+            )
 
-        # string.sub
-        m = re.fullmatch(
-            r"string\s*\.\s*sub\s*\(\s*(.*?)\s*,\s*(.*?)(?:\s*,\s*(.*?))?\s*\)",
-            expr,
-            re.S
-        )
+            if is_unknown(value):
+                return UNKNOWN
 
-        if m:
-            value = self.eval(m.group(1))
-            start = self.eval(m.group(2))
-            stop = self.eval(m.group(3)) if m.group(3) else None
+            return not lua_bool(value)
 
-            if (
-                isinstance(value, str)
-                and isinstance(start, (int, float))
-            ):
-                start = int(start)
-
-                if start < 0:
-                    start = len(value) + start + 1
-
-                start = max(1, start)
-
-                if stop is None:
-                    return value[start - 1:]
-
-                if isinstance(stop, (int, float)):
-                    stop = int(stop)
-
-                    if stop < 0:
-                        stop = len(value) + stop + 1
-
-                    return value[start - 1:stop]
-
-        # table.concat
-        m = re.fullmatch(
-            r"table\s*\.\s*concat\s*\(\s*(.*?)(?:\s*,\s*(.*?))?\s*\)",
-            expr,
-            re.S
-        )
-
-        if m:
-            table_expr = m.group(1)
-            separator = self.eval(m.group(2)) if m.group(2) else ""
-
-            if not isinstance(separator, str):
-                separator = ""
-
-            table = self.get_table(table_expr)
-
-            if table is not None:
-                values = []
-
-                for i in range(1, len(table) + 1):
-                    if i in table:
-                        values.append(str(table[i]))
-
-                return separator.join(values)
-
-        # concatenation
-        pieces = split_top_level_operator(expr, "..")
-
-        if len(pieces) > 1:
-            values = []
-
-            for piece in pieces:
-                value = self.eval(piece)
-
-                if value is None:
-                    return None
-
-                values.append(str(value))
-
-            return "".join(values)
-
+        # ----------------------------------------------------
         # Unary minus
+        # ----------------------------------------------------
+
         if expr.startswith("-"):
-            value = self.eval(expr[1:])
+            value = self.eval(
+                expr[1:],
+                env
+            )
 
             if isinstance(value, (int, float)):
                 return -value
 
-        # Unary not
-        if expr.startswith("not "):
-            value = self.eval(expr[4:])
+        # ----------------------------------------------------
+        # Function calls / method calls
+        # ----------------------------------------------------
 
-            if value is not None:
-                return not bool(value)
+        call = self.parse_call(expr)
 
-        # Arithmetic
-        for op in ["+", "-", "*", "/", "%", "^"]:
-            parts = split_binary(expr, op)
+        if call:
+            name, args, method = call
 
-            if parts:
-                left = self.eval(parts[0])
-                right = self.eval(parts[1])
+            return self.call_function(
+                name,
+                args,
+                env,
+                method
+            )
 
-                if (
-                    isinstance(left, (int, float))
-                    and isinstance(right, (int, float))
-                ):
-                    try:
-                        if op == "+":
-                            return left + right
-                        if op == "-":
-                            return left - right
-                        if op == "*":
-                            return left * right
-                        if op == "/":
-                            if right == 0:
-                                return None
-                            return left / right
-                        if op == "%":
-                            return left % right
-                        if op == "^":
-                            return left ** right
-                    except Exception:
-                        return None
+        # ----------------------------------------------------
+        # Index access
+        # ----------------------------------------------------
 
-        # Comparisons
-        for op in ["==", "~=", "<=", ">=", "<", ">"]:
-            parts = split_binary(expr, op)
+        access = self.parse_index(expr)
 
-            if parts:
-                left = self.eval(parts[0])
-                right = self.eval(parts[1])
+        if access:
+            base_expr, key_expr = access
 
-                if left is not None and right is not None:
-                    if op == "==":
-                        return left == right
-                    if op == "~=":
-                        return left != right
-                    if op == "<=":
-                        return left <= right
-                    if op == ">=":
-                        return left >= right
-                    if op == "<":
-                        return left < right
-                    if op == ">":
-                        return left > right
+            base = self.eval(
+                base_expr,
+                env
+            )
 
-        return None
+            key = self.eval(
+                key_expr,
+                env
+            )
 
-    def get_table(self, expr):
-        expr = expr.strip()
+            return self.index_value(
+                base,
+                key
+            )
 
-        if expr in self.tables:
-            return self.tables[expr]
+        # ----------------------------------------------------
+        # Concatenation
+        # ----------------------------------------------------
 
-        if expr.startswith("{") and expr.endswith("}"):
-            items = split_top_level(expr[1:-1])
-            table = {}
+        parts = self.split_operator(
+            expr,
+            ".."
+        )
 
-            index = 1
+        if len(parts) > 1:
+            values = []
 
-            for item in items:
-                if not item:
+            for part in parts:
+                value = self.eval(
+                    part,
+                    env
+                )
+
+                if is_unknown(value):
+                    return UNKNOWN
+
+                values.append(
+                    lua_tostring(value)
+                )
+
+            return "".join(values)
+
+        # ----------------------------------------------------
+        # OR
+        # ----------------------------------------------------
+
+        parts = self.split_operator(
+            expr,
+            " or "
+        )
+
+        if len(parts) > 1:
+            for part in parts:
+                value = self.eval(
+                    part,
+                    env
+                )
+
+                if is_unknown(value):
                     continue
 
-                value = self.eval(item)
+                if lua_bool(value):
+                    return value
 
-                if value is None:
-                    return None
+            return UNKNOWN
 
-                table[index] = value
-                index += 1
+        # ----------------------------------------------------
+        # AND
+        # ----------------------------------------------------
 
-            return table
+        parts = self.split_operator(
+            expr,
+            " and "
+        )
+
+        if len(parts) > 1:
+            result = None
+
+            for part in parts:
+                value = self.eval(
+                    part,
+                    env
+                )
+
+                if is_unknown(value):
+                    return UNKNOWN
+
+                if not lua_bool(value):
+                    return value
+
+                result = value
+
+            return result
+
+        # ----------------------------------------------------
+        # Comparisons
+        # ----------------------------------------------------
+
+        for op in [
+            "==",
+            "~=",
+            "<=",
+            ">=",
+            "<",
+            ">"
+        ]:
+            parts = self.split_operator(
+                expr,
+                op
+            )
+
+            if len(parts) == 2:
+                a = self.eval(parts[0], env)
+                b = self.eval(parts[1], env)
+
+                if is_unknown(a) or is_unknown(b):
+                    return UNKNOWN
+
+                try:
+                    if op == "==":
+                        return a == b
+                    if op == "~=":
+                        return a != b
+                    if op == "<=":
+                        return a <= b
+                    if op == ">=":
+                        return a >= b
+                    if op == "<":
+                        return a < b
+                    if op == ">":
+                        return a > b
+                except Exception:
+                    return UNKNOWN
+
+        # ----------------------------------------------------
+        # Arithmetic
+        # ----------------------------------------------------
+
+        for op in [
+            "+",
+            "-",
+            "*",
+            "/",
+            "%",
+            "^"
+        ]:
+            parts = self.split_operator(
+                expr,
+                op
+            )
+
+            if len(parts) == 2:
+                a = self.eval(parts[0], env)
+                b = self.eval(parts[1], env)
+
+                if not isinstance(a, (int, float)):
+                    return UNKNOWN
+
+                if not isinstance(b, (int, float)):
+                    return UNKNOWN
+
+                try:
+                    if op == "+":
+                        return a + b
+
+                    if op == "-":
+                        return a - b
+
+                    if op == "*":
+                        return a * b
+
+                    if op == "/":
+                        if b == 0:
+                            return UNKNOWN
+                        return a / b
+
+                    if op == "%":
+                        return a % b
+
+                    if op == "^":
+                        return a ** b
+
+                except Exception:
+                    return UNKNOWN
+
+        return UNKNOWN
+
+    # --------------------------------------------------------
+    # NUMBER
+    # --------------------------------------------------------
+
+    def parse_number(self, text):
+        text = text.strip()
+
+        try:
+            if re.fullmatch(
+                r"0[xX][0-9A-Fa-f]+",
+                text
+            ):
+                return int(text, 16)
+
+            if re.fullmatch(
+                r"0[bB][01]+",
+                text
+            ):
+                return int(text, 2)
+
+            if re.fullmatch(
+                r"0[oO][0-7]+",
+                text
+            ):
+                return int(text, 8)
+
+            if re.fullmatch(
+                r"-?\d+",
+                text
+            ):
+                return int(text)
+
+            if re.fullmatch(
+                r"-?\d+\.\d+",
+                text
+            ):
+                return float(text)
+
+        except Exception:
+            pass
 
         return None
 
-    @staticmethod
-    def balanced(text):
+    # --------------------------------------------------------
+    # OPERATOR SPLIT
+    # --------------------------------------------------------
+
+    def split_operator(self, text, operator):
+        result = []
+        start = 0
         depth = 0
         quote = None
         i = 0
@@ -807,33 +861,1010 @@ class Evaluator:
 
             if c in "\"'":
                 quote = c
+                i += 1
+                continue
 
-            elif c in "([{":
+            if c in "([{":
                 depth += 1
+                i += 1
+                continue
 
-            elif c in ")]}":
+            if c in ")]}":
                 depth -= 1
+                i += 1
+                continue
 
-                if depth < 0:
-                    return False
+            if depth == 0 and text.startswith(
+                operator,
+                i
+            ):
+                result.append(
+                    text[start:i].strip()
+                )
+
+                start = i + len(operator)
+                i += len(operator)
+                continue
 
             i += 1
 
-        return depth == 0 and quote is None
+        result.append(
+            text[start:].strip()
+        )
+
+        return result
+
+    # --------------------------------------------------------
+    # TABLE
+    # --------------------------------------------------------
+
+    def eval_table(self, body, env):
+        table = LuaTable({})
+        index = 1
+
+        for item in split_top_level(body):
+            if not item:
+                continue
+
+            # [key] = value
+            m = re.match(
+                r"^\s*\[(.*?)\]\s*=\s*(.*)$",
+                item,
+                re.S
+            )
+
+            if m:
+                key = self.eval(
+                    m.group(1),
+                    env
+                )
+
+                value = self.eval(
+                    m.group(2),
+                    env
+                )
+
+                if is_unknown(key) or is_unknown(value):
+                    continue
+
+                table.set(
+                    key,
+                    value
+                )
+
+                continue
+
+            # name = value
+            m = re.match(
+                r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$",
+                item,
+                re.S
+            )
+
+            if m:
+                key = m.group(1)
+
+                value = self.eval(
+                    m.group(2),
+                    env
+                )
+
+                if not is_unknown(value):
+                    table.set(
+                        key,
+                        value
+                    )
+
+                continue
+
+            # Array item
+            value = self.eval(
+                item,
+                env
+            )
+
+            if not is_unknown(value):
+                table.set(
+                    index,
+                    value
+                )
+
+            index += 1
+
+        return table
+
+    # --------------------------------------------------------
+    # INDEX
+    # --------------------------------------------------------
+
+    def parse_index(self, expr):
+        depth = 0
+        quote = None
+
+        for i in range(len(expr) - 1, -1, -1):
+            c = expr[i]
+
+            if quote:
+                if c == quote:
+                    quote = None
+
+                continue
+
+            if c in "\"'":
+                quote = c
+                continue
+
+            if c == "]":
+                depth += 1
+
+            elif c == "[":
+                depth -= 1
+
+                if depth == 0:
+                    if i == 0:
+                        return None
+
+                    if not expr.endswith("]"):
+                        return None
+
+                    return (
+                        expr[:i].strip(),
+                        expr[i + 1:-1].strip()
+                    )
+
+        # .field
+        m = re.match(
+            r"^(.*?)\.([A-Za-z_][A-Za-z0-9_]*)$",
+            expr,
+            re.S
+        )
+
+        if m:
+            return (
+                m.group(1).strip(),
+                '"' + m.group(2) + '"'
+            )
+
+        return None
+
+    # --------------------------------------------------------
+    # INDEX VALUE
+    # --------------------------------------------------------
+
+    def index_value(self, base, key):
+        if isinstance(base, LuaTable):
+            return base.get(key)
+
+        if isinstance(base, str):
+            if isinstance(key, (int, float)):
+                index = int(key)
+
+                if 1 <= index <= len(base):
+                    return base[index - 1]
+
+        return UNKNOWN
+
+    # --------------------------------------------------------
+    # CALL PARSER
+    # --------------------------------------------------------
+
+    def parse_call(self, expr):
+        expr = expr.strip()
+
+        # name(args)
+        m = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(",
+            expr
+        )
+
+        if m:
+            name = m.group(1)
+
+            pos = m.end() - 1
+            end = find_matching(
+                expr,
+                pos
+            )
+
+            if end == len(expr) - 1:
+                inside = expr[
+                    pos + 1:end
+                ]
+
+                return (
+                    name,
+                    split_top_level(inside),
+                    None
+                )
+
+        # obj:method(args)
+        m = re.match(
+            r"^(.+?):([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            expr,
+            re.S
+        )
+
+        if m:
+            object_expr = m.group(1).strip()
+            method = m.group(2)
+
+            pos = m.end() - 1
+
+            end = find_matching(
+                expr,
+                pos
+            )
+
+            if end == len(expr) - 1:
+                inside = expr[
+                    pos + 1:end
+                ]
+
+                return (
+                    object_expr,
+                    split_top_level(inside),
+                    method
+                )
+
+        return None
+
+    # --------------------------------------------------------
+    # CALL FUNCTION
+    # --------------------------------------------------------
+
+    def call_function(
+        self,
+        name,
+        arg_exprs,
+        env,
+        method=None
+    ):
+        # ----------------------------------------------------
+        # String methods
+        # ----------------------------------------------------
+
+        if method:
+            obj = self.eval(
+                name,
+                env
+            )
+
+            args = [
+                self.eval(x, env)
+                for x in arg_exprs
+            ]
+
+            if is_unknown(obj):
+                return UNKNOWN
+
+            if method == "reverse":
+                if isinstance(obj, str):
+                    return obj[::-1]
+
+            if method == "upper":
+                if isinstance(obj, str):
+                    return obj.upper()
+
+            if method == "lower":
+                if isinstance(obj, str):
+                    return obj.lower()
+
+            if method == "sub":
+                if isinstance(obj, str):
+                    if not args:
+                        return UNKNOWN
+
+                    start = args[0]
+
+                    if not isinstance(start, (int, float)):
+                        return UNKNOWN
+
+                    start = int(start)
+
+                    if start < 0:
+                        start = len(obj) + start + 1
+
+                    start = max(1, start)
+
+                    if len(args) >= 2:
+                        stop = args[1]
+
+                        if not isinstance(
+                            stop,
+                            (int, float)
+                        ):
+                            return UNKNOWN
+
+                        stop = int(stop)
+
+                        if stop < 0:
+                            stop = len(obj) + stop + 1
+
+                        return obj[
+                            start - 1:stop
+                        ]
+
+                    return obj[start - 1:]
+
+            return UNKNOWN
+
+        # ----------------------------------------------------
+        # Builtins
+        # ----------------------------------------------------
+
+        args = [
+            self.eval(x, env)
+            for x in arg_exprs
+        ]
+
+        if name in {
+            "print",
+            "warn",
+            "error"
+        }:
+            return UNKNOWN
+
+        if name == "string.char":
+            if any(is_unknown(x) for x in args):
+                return UNKNOWN
+
+            try:
+                return "".join(
+                    chr(int(x) & 255)
+                    for x in args
+                )
+            except Exception:
+                return UNKNOWN
+
+        if name == "string.byte":
+            if not args:
+                return UNKNOWN
+
+            if not isinstance(args[0], str):
+                return UNKNOWN
+
+            pos = 1
+
+            if len(args) >= 2:
+                if isinstance(
+                    args[1],
+                    (int, float)
+                ):
+                    pos = int(args[1])
+
+            if 1 <= pos <= len(args[0]):
+                return ord(args[0][pos - 1])
+
+            return UNKNOWN
+
+        if name == "string.reverse":
+            if len(args) == 1 and isinstance(
+                args[0],
+                str
+            ):
+                return args[0][::-1]
+
+            return UNKNOWN
+
+        if name == "string.lower":
+            if len(args) == 1 and isinstance(
+                args[0],
+                str
+            ):
+                return args[0].lower()
+
+            return UNKNOWN
+
+        if name == "string.upper":
+            if len(args) == 1 and isinstance(
+                args[0],
+                str
+            ):
+                return args[0].upper()
+
+            return UNKNOWN
+
+        if name == "string.len":
+            if len(args) == 1 and isinstance(
+                args[0],
+                str
+            ):
+                return len(args[0])
+
+            return UNKNOWN
+
+        if name == "string.rep":
+            if len(args) >= 2:
+                if (
+                    isinstance(args[0], str)
+                    and isinstance(args[1], (int, float))
+                ):
+                    return args[0] * int(args[1])
+
+            return UNKNOWN
+
+        if name == "string.sub":
+            if len(args) < 2:
+                return UNKNOWN
+
+            s = args[0]
+
+            if not isinstance(s, str):
+                return UNKNOWN
+
+            start = args[1]
+
+            if not isinstance(start, (int, float)):
+                return UNKNOWN
+
+            start = int(start)
+
+            if start < 0:
+                start = len(s) + start + 1
+
+            start = max(1, start)
+
+            if len(args) >= 3:
+                stop = args[2]
+
+                if not isinstance(
+                    stop,
+                    (int, float)
+                ):
+                    return UNKNOWN
+
+                stop = int(stop)
+
+                if stop < 0:
+                    stop = len(s) + stop + 1
+
+                return s[start - 1:stop]
+
+            return s[start - 1:]
+
+        if name == "table.concat":
+            if not args:
+                return UNKNOWN
+
+            table = args[0]
+
+            if not isinstance(
+                table,
+                LuaTable
+            ):
+                return UNKNOWN
+
+            separator = ""
+
+            if len(args) >= 2:
+                if isinstance(args[1], str):
+                    separator = args[1]
+
+            values = []
+
+            for i in range(
+                1,
+                table.length() + 1
+            ):
+                value = table.get(i)
+
+                if is_unknown(value):
+                    return UNKNOWN
+
+                values.append(
+                    lua_tostring(value)
+                )
+
+            return separator.join(values)
+
+        if name == "table.insert":
+            if len(args) == 2:
+                table = args[0]
+
+                if isinstance(table, LuaTable):
+                    table.set(
+                        table.length() + 1,
+                        args[1]
+                    )
+
+                    return None
+
+            if len(args) == 3:
+                table = args[0]
+
+                if isinstance(table, LuaTable):
+                    pos = args[1]
+
+                    if isinstance(
+                        pos,
+                        (int, float)
+                    ):
+                        pos = int(pos)
+
+                        for i in range(
+                            table.length(),
+                            pos - 1,
+                            -1
+                        ):
+                            table.set(
+                                i + 1,
+                                table.get(i)
+                            )
+
+                        table.set(
+                            pos,
+                            args[2]
+                        )
+
+                        return None
+
+            return UNKNOWN
+
+        if name == "tonumber":
+            if not args:
+                return UNKNOWN
+
+            value = args[0]
+
+            if isinstance(
+                value,
+                (int, float)
+            ):
+                return value
+
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except Exception:
+                    try:
+                        return float(value)
+                    except Exception:
+                        return UNKNOWN
+
+        if name == "tostring":
+            if not args:
+                return UNKNOWN
+
+            return lua_tostring(args[0])
+
+        if name == "string.format":
+            if not args:
+                return UNKNOWN
+
+            fmt = args[0]
+
+            if not isinstance(fmt, str):
+                return UNKNOWN
+
+            values = args[1:]
+
+            # Important for generated load()
+            if fmt == "%q" and values:
+                return lua_quote(
+                    lua_tostring(values[0])
+                )
+
+            try:
+                result = fmt
+
+                for value in values:
+                    if "%q" in result:
+                        result = result.replace(
+                            "%q",
+                            lua_quote(
+                                lua_tostring(value)
+                            ),
+                            1
+                        )
+
+                    elif "%s" in result:
+                        result = result.replace(
+                            "%s",
+                            lua_tostring(value),
+                            1
+                        )
+
+                    elif "%d" in result:
+                        result = result.replace(
+                            "%d",
+                            str(int(value)),
+                            1
+                        )
+
+                return result
+
+            except Exception:
+                return UNKNOWN
+
+        # ----------------------------------------------------
+        # User-defined function
+        # ----------------------------------------------------
+
+        if name in self.functions:
+            fn = self.functions[name]
+
+            if not isinstance(
+                fn,
+                LuaFunction
+            ):
+                return UNKNOWN
+
+            child = dict(self.env)
+
+            for i, param in enumerate(
+                fn.params
+            ):
+                if i < len(args):
+                    child[param] = args[i]
+                else:
+                    child[param] = None
+
+            # If it is a pure return expression
+            if fn.return_expr:
+                return self.eval(
+                    fn.return_expr,
+                    child
+                )
+
+            # Full tiny body interpreter
+            return self.execute_body(
+                fn.body,
+                child
+            )
+
+        # ----------------------------------------------------
+        # Alias
+        # ----------------------------------------------------
+
+        if name in self.env:
+            fn = self.env[name]
+
+            if isinstance(
+                fn,
+                LuaFunction
+            ):
+                child = dict(self.env)
+
+                for i, param in enumerate(
+                    fn.params
+                ):
+                    if i < len(args):
+                        child[param] = args[i]
+
+                if fn.return_expr:
+                    return self.eval(
+                        fn.return_expr,
+                        child
+                    )
+
+        return UNKNOWN
+
+    # --------------------------------------------------------
+    # FUNCTION COLLECTION
+    # --------------------------------------------------------
+
+    def collect_functions(self, code):
+        # local name = function(a,b) ... end
+        pattern = re.compile(
+            r"""
+            (?:local\s+)?
+            ([A-Za-z_][A-Za-z0-9_]*)
+            \s*=\s*function\s*
+            \((.*?)\)
+            (.*?)
+            \bend
+            """,
+            re.X | re.S
+        )
+
+        for m in pattern.finditer(code):
+            name = m.group(1)
+            params = [
+                x.strip()
+                for x in m.group(2).split(",")
+                if x.strip()
+            ]
+
+            body = m.group(3).strip()
+
+            return_expr = None
+
+            rm = re.search(
+                r"\breturn\s+(.+?)(?:;|$)",
+                body,
+                re.S
+            )
+
+            if rm:
+                return_expr = rm.group(1).strip()
+
+            self.functions[name] = LuaFunction(
+                params=params,
+                body=body,
+                return_expr=return_expr
+            )
+
+    # --------------------------------------------------------
+    # GLOBAL ASSIGNMENTS
+    # --------------------------------------------------------
+
+    def collect_assignments(self, code):
+        # Multiple iterations are intentional.
+        for _ in range(20):
+            changed = False
+
+            pattern = re.compile(
+                r"""
+                (?m)^\s*
+                (?:local\s+)?
+                ([A-Za-z_][A-Za-z0-9_]*)
+                \s*=\s*(.+?)
+                \s*$
+                """,
+                re.X
+            )
+
+            for m in pattern.finditer(code):
+                name = m.group(1)
+                expr = m.group(2).strip()
+
+                # Don't treat function definitions as values here.
+                if expr.startswith("function"):
+                    continue
+
+                value = self.eval(
+                    expr,
+                    self.env
+                )
+
+                if not is_unknown(value):
+                    if (
+                        name not in self.env
+                        or self.env[name] != value
+                    ):
+                        self.env[name] = value
+                        changed = True
+
+            if not changed:
+                break
+
+    # --------------------------------------------------------
+    # BODY EXECUTION
+    # --------------------------------------------------------
+
+    def execute_body(self, body, env):
+        # ----------------------------------------------------
+        # local assignments
+        # ----------------------------------------------------
+
+        for m in re.finditer(
+            r"(?m)^\s*local\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+            r"\s*=\s*(.+?)\s*$",
+            body
+        ):
+            name = m.group(1)
+            expr = m.group(2)
+
+            value = self.eval(
+                expr,
+                env
+            )
+
+            if not is_unknown(value):
+                env[name] = value
+
+        # ----------------------------------------------------
+        # Numeric for
+        # ----------------------------------------------------
+
+        for m in re.finditer(
+            r"""
+            for\s+
+            ([A-Za-z_][A-Za-z0-9_]*)\s*=\s*
+            (.*?),\s*(.*?)(?:,\s*(.*?))?\s*
+            do
+            (.*?)
+            end
+            """,
+            body,
+            re.X | re.S
+        ):
+            var = m.group(1)
+            start = self.eval(
+                m.group(2),
+                env
+            )
+            stop = self.eval(
+                m.group(3),
+                env
+            )
+
+            step = 1
+
+            if m.group(4):
+                step = self.eval(
+                    m.group(4),
+                    env
+                )
+
+            inner = m.group(5)
+
+            if not all(
+                isinstance(x, (int, float))
+                for x in [start, stop, step]
+            ):
+                continue
+
+            if step == 0:
+                continue
+
+            current = int(start)
+            stop = int(stop)
+            step = int(step)
+
+            count = 0
+
+            while (
+                current <= stop
+                if step > 0
+                else current >= stop
+            ):
+                if count > 10000:
+                    break
+
+                env[var] = current
+
+                # local assignments inside loop
+                for lm in re.finditer(
+                    r"""
+                    local\s+
+                    ([A-Za-z_][A-Za-z0-9_]*)\s*=\s*
+                    (.+?)
+                    (?=\n|$)
+                    """,
+                    inner,
+                    re.X
+                ):
+                    value = self.eval(
+                        lm.group(2),
+                        env
+                    )
+
+                    if not is_unknown(value):
+                        env[lm.group(1)] = value
+
+                # table assignments
+                for am in re.finditer(
+                    r"""
+                    ([A-Za-z_][A-Za-z0-9_]*)\s*
+                    \[\s*(.*?)\s*\]\s*=\s*
+                    (.+?)
+                    (?=\n|$)
+                    """,
+                    inner,
+                    re.X
+                ):
+                    table_name = am.group(1)
+                    key = self.eval(
+                        am.group(2),
+                        env
+                    )
+                    value = self.eval(
+                        am.group(3),
+                        env
+                    )
+
+                    table = env.get(
+                        table_name
+                    )
+
+                    if (
+                        isinstance(table, LuaTable)
+                        and not is_unknown(key)
+                        and not is_unknown(value)
+                    ):
+                        table.set(
+                            key,
+                            value
+                        )
+
+                current += step
+                count += 1
+
+        # ----------------------------------------------------
+        # return
+        # ----------------------------------------------------
+
+        matches = list(
+            re.finditer(
+                r"\breturn\s+(.+?)(?:;|\n|$)",
+                body,
+                re.S
+            )
+        )
+
+        if matches:
+            expr = matches[-1].group(1).strip()
+
+            return self.eval(
+                expr,
+                env
+            )
+
+        return UNKNOWN
+
+    # --------------------------------------------------------
+    # LOAD STATIC UNWRAPPER
+    # --------------------------------------------------------
+
+    def unwrap_static_load(self, code):
+        pattern = re.compile(
+            r"""
+            \bload\s*\(
+            (.*?)
+            \)
+            """,
+            re.X | re.S
+        )
+
+        replacements = []
+
+        for m in pattern.finditer(code):
+            expr = m.group(1)
+
+            value = self.eval(
+                expr,
+                self.env
+            )
+
+            if isinstance(value, str):
+                # We don't execute it.
+                # We only expose the generated source.
+                replacements.append(
+                    (
+                        m.start(),
+                        m.end(),
+                        value
+                    )
+                )
+
+        for start, end, value in reversed(
+            replacements
+        ):
+            code = (
+                code[:start]
+                + value
+                + code[end:]
+            )
+
+        return code
 
 
-def split_top_level_operator(text, operator):
-    parts = []
-    start = 0
-    depth = 0
-    quote = None
+# ============================================================
+# AST-LIKE SOURCE CLEANER
+# ============================================================
+
+def remove_comments(code):
+    code = re.sub(
+        r"--\[(=*)\[.*?\]\1\]",
+        "",
+        code,
+        flags=re.S
+    )
+
+    result = []
     i = 0
+    quote = None
 
-    while i < len(text):
-        c = text[i]
+    while i < len(code):
+        c = code[i]
 
         if quote:
-            if c == "\\":
+            result.append(c)
+
+            if c == "\\" and i + 1 < len(code):
+                result.append(code[i + 1])
                 i += 2
                 continue
 
@@ -845,501 +1876,146 @@ def split_top_level_operator(text, operator):
 
         if c in "\"'":
             quote = c
+            result.append(c)
             i += 1
             continue
 
-        if c in "([{":
-            depth += 1
-            i += 1
+        if (
+            c == "-"
+            and i + 1 < len(code)
+            and code[i + 1] == "-"
+        ):
+            while (
+                i < len(code)
+                and code[i] != "\n"
+            ):
+                i += 1
+
+            result.append("\n")
             continue
 
-        if c in ")]}":
-            depth -= 1
-            i += 1
-            continue
-
-        if depth == 0 and text.startswith(operator, i):
-            parts.append(text[start:i].strip())
-            start = i + len(operator)
-            i += len(operator)
-            continue
-
+        result.append(c)
         i += 1
 
-    parts.append(text[start:].strip())
-    return parts
+    return "".join(result)
 
 
 # ============================================================
-# TABLE EXTRACTION
+# APPLY STATIC VALUES TO SOURCE
 # ============================================================
 
-def extract_tables(code):
-    tables = {}
-
-    pattern = re.compile(
-        rf"(?:local\s+)?({IDENT})\s*=\s*\{{(.*?)\}}",
-        re.S
-    )
-
-    for m in pattern.finditer(code):
-        name = m.group(1)
-        body = m.group(2)
-
-        parts = split_top_level(body)
-        table = {}
-        index = 1
-
-        for part in parts:
-            if not part:
-                continue
-
-            key_value = split_binary(part, "=")
-
-            if key_value:
-                key, value_expr = key_value
-                key = key.strip()
-
-                if re.fullmatch(r"\d+", key):
-                    idx = int(key)
-                elif is_string_literal(key):
-                    idx = decode_string_literal(key)
-                else:
-                    idx = None
-
-                if idx is not None:
-                    value = Evaluator(tables=tables).eval(value_expr)
-
-                    if value is not None:
-                        table[idx] = value
-
-                    continue
-
-            value = Evaluator(tables=tables).eval(part)
-
-            if value is not None:
-                table[index] = value
-
-            index += 1
-
-        if table:
-            tables[name] = table
-
-    return tables
-
-
-# ============================================================
-# CONSTANT PROPAGATION
-# ============================================================
-
-def extract_constants(code, tables):
-    constants = {}
-
-    changed = True
-
-    while changed:
-        changed = False
-
-        evaluator = Evaluator(constants, tables)
-
-        pattern = re.compile(
-            rf"(?m)^\s*(?:local\s+)?({IDENT})\s*=\s*(.+?)\s*$"
-        )
-
-        for m in pattern.finditer(code):
-            name = m.group(1)
-            expr = m.group(2).strip()
-
-            if name in {
-                "local",
-                "function",
-                "if",
-                "for",
-                "while",
-                "return",
-            }:
-                continue
-
-            value = evaluator.eval(expr)
-
-            if value is not None and name not in constants:
-                constants[name] = value
-                changed = True
-
-    return constants
-
-
-# ============================================================
-# CONSTANT FOLDING
-# ============================================================
-
-def fold_expressions(code, constants, tables):
-    evaluator = Evaluator(constants, tables)
-
-    # Repeat because one replacement can reveal another.
-    for _ in range(12):
-
-        old = code
-
-        # string.char(...)
-        def char_replace(match):
-            value = evaluator.eval(
-                "string.char(" + match.group(1) + ")"
-            )
-
-            if isinstance(value, str):
-                return lua_quote(value)
-
-            return match.group(0)
-
-        code = re.sub(
-            r"string\s*\.\s*char\s*\(([^()]*)\)",
-            char_replace,
-            code
-        )
-
-        # reverse
-        def reverse_replace(match):
-            value = evaluator.eval(
-                "string.reverse(" + match.group(1) + ")"
-            )
-
-            if isinstance(value, str):
-                return lua_quote(value)
-
-            return match.group(0)
-
-        code = re.sub(
-            r"string\s*\.\s*reverse\s*\(\s*(.*?)\s*\)",
-            reverse_replace,
-            code
-        )
-
-        # lower
-        def lower_replace(match):
-            value = evaluator.eval(
-                "string.lower(" + match.group(1) + ")"
-            )
-
-            if isinstance(value, str):
-                return lua_quote(value)
-
-            return match.group(0)
-
-        code = re.sub(
-            r"string\s*\.\s*lower\s*\(\s*(.*?)\s*\)",
-            lower_replace,
-            code
-        )
-
-        # upper
-        def upper_replace(match):
-            value = evaluator.eval(
-                "string.upper(" + match.group(1) + ")"
-            )
-
-            if isinstance(value, str):
-                return lua_quote(value)
-
-            return match.group(0)
-
-        code = re.sub(
-            r"string\s*\.\s*upper\s*\(\s*(.*?)\s*\)",
-            upper_replace,
-            code
-        )
-
-        # tostring
-        def tostring_replace(match):
-            value = evaluator.eval(
-                "tostring(" + match.group(1) + ")"
-            )
-
-            if value is not None:
-                return lua_quote(str(value))
-
-            return match.group(0)
-
-        code = re.sub(
-            r"tostring\s*\(\s*([^()]+?)\s*\)",
-            tostring_replace,
-            code
-        )
-
-        # tonumber
-        def tonumber_replace(match):
-            value = evaluator.eval(
-                "tonumber(" + match.group(1) + ")"
-            )
-
-            if isinstance(value, (int, float)):
-                return str(value)
-
-            return match.group(0)
-
-        code = re.sub(
-            r"tonumber\s*\(\s*([^()]+?)\s*\)",
-            tonumber_replace,
-            code
-        )
-
-        # Simple concat
-        for _ in range(6):
-            def concat_replace(match):
-                left = match.group(1)
-                right = match.group(2)
-
-                lv = evaluator.eval(left)
-                rv = evaluator.eval(right)
-
-                if lv is not None and rv is not None:
-                    return lua_quote(str(lv) + str(rv))
-
-                return match.group(0)
-
-            new_code = re.sub(
-                r'((?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'))\s*\.\.\s*'
-                r'((?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\d+))',
-                concat_replace,
-                code
-            )
-
-            if new_code == code:
-                break
-
-            code = new_code
-
-        # Replace known constants only when they are standalone.
-        for name, value in sorted(
-            constants.items(),
-            key=lambda x: len(x[0]),
-            reverse=True
+def replace_known_constants(code, env):
+    # Longest first.
+    for name, value in sorted(
+        env.items(),
+        key=lambda x: len(x[0]),
+        reverse=True
+    ):
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*",
+            name
         ):
-            if isinstance(value, (str, int, float, bool)):
-                replacement = (
-                    lua_quote(value)
-                    if isinstance(value, str)
-                    else str(value).lower()
-                    if isinstance(value, bool)
-                    else str(value)
-                )
+            continue
 
-                code = re.sub(
-                    rf"\b{re.escape(name)}\b",
-                    replacement,
-                    code
-                )
+        if isinstance(value, str):
+            replacement = lua_quote(value)
 
-        # Remove parentheses around literals
-        code = re.sub(
-            r'\(\s*("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|-?\d+(?:\.\d+)?)\s*\)',
-            r'\1',
-            code
-        )
+        elif isinstance(value, bool):
+            replacement = (
+                "true"
+                if value
+                else "false"
+            )
 
-        # Arithmetic constants
-        def arithmetic(match):
-            a = match.group(1)
-            op = match.group(2)
-            b = match.group(3)
+        elif isinstance(
+            value,
+            (int, float)
+        ):
+            replacement = (
+                str(int(value))
+                if isinstance(value, float)
+                and value.is_integer()
+                else str(value)
+            )
 
-            av = parse_number(a)
-            bv = parse_number(b)
+        elif isinstance(value, LuaTable):
+            continue
 
-            if av is None or bv is None:
-                return match.group(0)
-
-            try:
-                if op == "+":
-                    result = av + bv
-                elif op == "-":
-                    result = av - bv
-                elif op == "*":
-                    result = av * bv
-                elif op == "/":
-                    if bv == 0:
-                        return match.group(0)
-                    result = av / bv
-                elif op == "%":
-                    result = av % bv
-                elif op == "^":
-                    result = av ** bv
-                else:
-                    return match.group(0)
-
-                if isinstance(result, float) and result.is_integer():
-                    return str(int(result))
-
-                return str(result)
-
-            except Exception:
-                return match.group(0)
+        else:
+            continue
 
         code = re.sub(
-            r'(?<![\w.])(-?\d+(?:\.\d+)?)\s*([+\-*/%^])\s*(-?\d+(?:\.\d+)?)(?![\w.])',
-            arithmetic,
+            rf"\b{re.escape(name)}\b",
+            replacement,
             code
         )
-
-        if code == old:
-            break
 
     return code
 
 
 # ============================================================
-# DECIMAL / HEX ESCAPE NORMALIZATION
+# TABLE TO SOURCE
 # ============================================================
 
-def decode_string_escapes_in_code(code):
-    def replace(match):
-        token = match.group(0)
-        value = decode_string_literal(token)
-
-        if value is None:
-            return token
-
+def value_to_source(value):
+    if isinstance(value, str):
         return lua_quote(value)
 
-    return STRING_RE.sub(replace, code)
+    if value is True:
+        return "true"
+
+    if value is False:
+        return "false"
+
+    if value is None:
+        return "nil"
+
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+
+        return str(value)
+
+    if isinstance(value, LuaTable):
+        parts = []
+
+        for key, val in value.items.items():
+            if isinstance(key, int):
+                parts.append(
+                    value_to_source(val)
+                )
+            else:
+                parts.append(
+                    "["
+                    + value_to_source(key)
+                    + "]="
+                    + value_to_source(val)
+                )
+
+        return "{ " + ", ".join(parts) + " }"
+
+    return None
 
 
 # ============================================================
-# SIMPLE FUNCTION INLINING
+# CLEAN GENERATED VARIABLES
 # ============================================================
 
-def inline_simple_char_functions(code):
-    functions = {}
-
-    pattern = re.compile(
-        rf"""
-        local\s+({IDENT})\s*=\s*function\s*
-        \(\s*({IDENT})\s*(?:,\s*({IDENT}))?\s*\)
-        \s*return\s+
-        string\.char\s*\(\s*
-        \2(?:\s*,\s*\3)?
-        \s*\)
-        \s*end
-        """,
-        re.X | re.S
-    )
-
-    for m in pattern.finditer(code):
-        name = m.group(1)
-        arg1 = m.group(2)
-        arg2 = m.group(3)
-
-        functions[name] = (arg1, arg2)
-
-    for name, args in functions.items():
-        a1, a2 = args
-
-        def replace(match):
-            inside = match.group(1)
-            values = split_top_level(inside)
-
-            if len(values) == 1 and a2 is None:
-                return "string.char(" + values[0] + ")"
-
-            if len(values) == 2:
-                return "string.char(" + values[0] + "," + values[1] + ")"
-
-            return match.group(0)
-
-        code = re.sub(
-            rf"\b{re.escape(name)}\s*\((.*?)\)",
-            replace,
-            code
-        )
-
-    return code
-
-
-# ============================================================
-# REMOVE USELESS CONSTRUCTS
-# ============================================================
-
-def simplify_code(code):
-    # true/false comparisons
-    code = re.sub(
-        r"\btrue\s*==\s*true\b",
-        "true",
+def clean_names(code):
+    names = re.findall(
+        r"\b_0[xX][0-9A-Fa-f]+\b",
         code
     )
 
-    code = re.sub(
-        r"\bfalse\s*==\s*false\b",
-        "true",
-        code
-    )
-
-    code = re.sub(
-        r"\btrue\s*==\s*false\b",
-        "false",
-        code
-    )
-
-    code = re.sub(
-        r"\bfalse\s*==\s*true\b",
-        "false",
-        code
-    )
-
-    # double negation
-    for _ in range(5):
-        code = re.sub(
-            r"\bnot\s+not\s+(.+)",
-            r"\1",
-            code
-        )
-
-    # empty do/end
-    code = re.sub(
-        r"\bdo\s*end\b",
-        "",
-        code
-    )
-
-    # Empty statements
-    code = re.sub(
-        r";\s*;",
-        ";",
-        code
-    )
-
-    # Excess semicolon at line end
-    code = re.sub(
-        r";\s*\n",
-        "\n",
-        code
-    )
-
-    # Duplicate blank lines
-    code = re.sub(
-        r"\n[ \t]*\n(?:[ \t]*\n)+",
-        "\n\n",
-        code
-    )
-
-    return code
-
-
-# ============================================================
-# VARIABLE NAME CLEANUP
-# ============================================================
-
-def clean_generated_names(code):
     mapping = {}
+
     counter = 1
 
-    generated = re.findall(
-        rf"\b(_0x[0-9A-Fa-f]+|_0X[0-9A-Fa-f]+|L\d+_?\d*|v\d+|tmp\d+)\b",
-        code
-    )
-
-    for name in generated:
+    for name in names:
         if name not in mapping:
-            mapping[name] = f"var_{counter}"
+            mapping[name] = (
+                f"decoded_{counter}"
+            )
             counter += 1
 
     for old, new in sorted(
@@ -1357,29 +2033,110 @@ def clean_generated_names(code):
 
 
 # ============================================================
-# STRING CONCAT NORMALIZATION
+# REMOVE TRIVIAL FUNCTION DEFINITIONS
 # ============================================================
 
-def merge_literal_concats(code):
-    for _ in range(10):
-        old = code
+def remove_redundant_functions(
+    code,
+    evaluator
+):
+    removable = []
 
-        pattern = re.compile(
-            r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
-            r'\s*\.\.\s*'
-            r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+    for name, fn in evaluator.functions.items():
+        if not fn.return_expr:
+            continue
+
+        # Count calls.
+        calls = len(
+            re.findall(
+                rf"\b{re.escape(name)}\s*\(",
+                code
+            )
         )
 
-        def repl(match):
-            a = decode_string_literal(match.group(1))
-            b = decode_string_literal(match.group(2))
+        if calls == 0:
+            removable.append(name)
 
-            if a is None or b is None:
-                return match.group(0)
+    for name in removable:
+        pattern = re.compile(
+            rf"""
+            (?:local\s+)?
+            {re.escape(name)}
+            \s*=\s*function\s*
+            \(
+            .*?
+            \)
+            .*?
+            \bend
+            """,
+            re.X | re.S
+        )
 
-            return lua_quote(a + b)
+        code = pattern.sub(
+            "",
+            code,
+            count=1
+        )
 
-        code = pattern.sub(repl, code)
+    return code
+
+
+# ============================================================
+# COLLAPSE STRING FUNCTIONS
+# ============================================================
+
+def collapse_calls(code, evaluator):
+    for _ in range(15):
+        old = code
+
+        # Function calls whose arguments are simple.
+        pattern = re.compile(
+            r"""
+            \b
+            ([A-Za-z_][A-Za-z0-9_]*)
+            \s*
+            \(
+                ([^()]|\([^()]*\))*
+            \)
+            """,
+            re.X
+        )
+
+        matches = list(
+            pattern.finditer(code)
+        )
+
+        for m in reversed(matches):
+            whole = m.group(0)
+
+            # Don't replace language constructs.
+            if m.group(1) in {
+                "if",
+                "for",
+                "while",
+                "function",
+                "return",
+                "local"
+            }:
+                continue
+
+            value = evaluator.eval(
+                whole,
+                evaluator.env
+            )
+
+            if is_unknown(value):
+                continue
+
+            if isinstance(
+                value,
+                (str, int, float, bool)
+            ):
+                code = (
+                    code[:m.start()]
+                    + value_to_source(value)
+                    + code[m.end():]
+                )
 
         if code == old:
             break
@@ -1388,350 +2145,262 @@ def merge_literal_concats(code):
 
 
 # ============================================================
-# TABLE CONCAT
-# ============================================================
-
-def expand_static_table_concat(code):
-    evaluator = Evaluator()
-
-    pattern = re.compile(
-        r"table\s*\.\s*concat\s*\(\s*\{(.*?)\}\s*\)",
-        re.S
-    )
-
-    def repl(match):
-        values = []
-
-        for item in split_top_level(match.group(1)):
-            value = evaluator.eval(item)
-
-            if value is None:
-                return match.group(0)
-
-            values.append(str(value))
-
-        return lua_quote("".join(values))
-
-    return pattern.sub(repl, code)
-
-
-# ============================================================
-# REVERSE STRING LITERALS
-# ============================================================
-
-def reverse_literals(code):
-    pattern = re.compile(
-        r"string\s*\.\s*reverse\s*\(\s*"
-        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
-        r"\s*\)"
-    )
-
-    def repl(match):
-        value = decode_string_literal(match.group(1))
-
-        if value is None:
-            return match.group(0)
-
-        return lua_quote(value[::-1])
-
-    return pattern.sub(repl, code)
-
-
-# ============================================================
-# STRING.CHAR
-# ============================================================
-
-def expand_string_char(code):
-    pattern = re.compile(
-        r"string\s*\.\s*char\s*\((.*?)\)",
-        re.S
-    )
-
-    def repl(match):
-        args = split_top_level(match.group(1))
-
-        if not args:
-            return match.group(0)
-
-        values = []
-
-        for arg in args:
-            n = parse_number(arg)
-
-            if n is None:
-                return match.group(0)
-
-            if not 0 <= int(n) <= 255:
-                return match.group(0)
-
-            values.append(chr(int(n)))
-
-        return lua_quote("".join(values))
-
-    return pattern.sub(repl, code)
-
-
-# ============================================================
-# HEX / DECIMAL STRING BYTE PATTERNS
-# ============================================================
-
-def expand_percent_escapes(code):
-    # %XX-like static sequences occasionally appear in custom decoders.
-    def repl(match):
-        raw = match.group(1)
-
-        try:
-            return lua_quote(
-                bytes.fromhex(raw).decode("latin-1")
-            )
-        except Exception:
-            return match.group(0)
-
-    return re.sub(
-        r'(["\'])(?:%([0-9A-Fa-f]{2})){2,}\1',
-        lambda m: m.group(0),
-        code
-    )
-
-
-# ============================================================
-# FUNCTION RETURN CONSTANT PROPAGATION
-# ============================================================
-
-def propagate_simple_returns(code):
-    functions = {}
-
-    pattern = re.compile(
-        rf"""
-        (?:local\s+)?function\s+({IDENT})\s*
-        \(\s*\)\s*
-        return\s+(.+?)
-        end
-        """,
-        re.X | re.S
-    )
-
-    for m in pattern.finditer(code):
-        name = m.group(1)
-        expr = m.group(2).strip()
-
-        value = Evaluator().eval(expr)
-
-        if value is not None:
-            functions[name] = value
-
-    for name, value in functions.items():
-        replacement = lua_quote(value) if isinstance(value, str) else str(value)
-
-        code = re.sub(
-            rf"\b{re.escape(name)}\s*\(\s*\)",
-            replacement,
-            code
-        )
-
-    return code
-
-
-# ============================================================
-# DEAD LOCAL CONSTANTS
-# ============================================================
-
-def remove_unused_simple_locals(code):
-    lines = code.splitlines()
-    result = []
-
-    for line in lines:
-        m = re.match(
-            rf"^\s*local\s+({IDENT})\s*=\s*(.+?)\s*$",
-            line
-        )
-
-        if not m:
-            result.append(line)
-            continue
-
-        name = m.group(1)
-
-        rest = "\n".join(lines)
-
-        occurrences = len(
-            re.findall(
-                rf"\b{re.escape(name)}\b",
-                rest
-            )
-        )
-
-        if occurrences <= 1:
-            # Only remove obvious constants.
-            value = m.group(2)
-
-            if (
-                is_string_literal(value.strip())
-                or is_number_literal(value.strip())
-            ):
-                continue
-
-        result.append(line)
-
-    return "\n".join(result)
-
-
-# ============================================================
-# NORMALIZE OPERATORS
-# ============================================================
-
-def normalize_operators(code):
-    code = re.sub(r"[ \t]+==[ \t]+", " == ", code)
-    code = re.sub(r"[ \t]+~=[ \t]+", " ~= ", code)
-    code = re.sub(r"[ \t]+<=[ \t]+", " <= ", code)
-    code = re.sub(r"[ \t]+>=[ \t]+", " >= ", code)
-    code = re.sub(r"[ \t]+\.\.[ \t]+", " .. ", code)
-    code = re.sub(r"[ \t]+\+[ \t]+", " + ", code)
-    code = re.sub(r"[ \t]+-[ \t]+", " - ", code)
-    code = re.sub(r"[ \t]+\*[ \t]+", " * ", code)
-    code = re.sub(r"[ \t]+/[ \t]+", " / ", code)
-
-    return code
-
-
-# ============================================================
-# INDENTATION
-# ============================================================
-
-BLOCK_OPEN = re.compile(
-    r"^\s*(local\s+)?function\b|"
-    r"^\s*function\b|"
-    r"^\s*if\b.*\bthen\s*$|"
-    r"^\s*for\b.*\bdo\s*$|"
-    r"^\s*while\b.*\bdo\s*$|"
-    r"^\s*repeat\s*$|"
-    r"^\s*do\s*$"
-)
-
-BLOCK_CLOSE = re.compile(
-    r"^\s*(end|until)\b"
-)
-
-MIDDLE = re.compile(
-    r"^\s*(else|elseif)\b"
-)
-
-
-def format_lua(code):
-    lines = code.splitlines()
-    result = []
-    indent = 0
-
-    for raw in lines:
-        line = raw.strip()
-
-        if not line:
-            if result and result[-1] != "":
-                result.append("")
-            continue
-
-        if BLOCK_CLOSE.match(line):
-            indent = max(0, indent - 1)
-
-        if MIDDLE.match(line):
-            indent = max(0, indent - 1)
-
-        result.append("    " * indent + line)
-
-        if MIDDLE.match(line):
-            indent += 1
-
-        elif BLOCK_OPEN.match(line):
-            if not re.search(r"\bend\s*$", line):
-                indent += 1
-
-    return "\n".join(result).strip() + "\n"
-
-
-# ============================================================
-# FULL PIPELINE
+# STATIC PASS
 # ============================================================
 
 def deobfuscate(source):
     stats = {
-        "passes": 0,
+        "rounds": 0,
         "changes": 0,
+        "functions": 0,
+        "constants": 0,
     }
 
     code = source
 
-    passes = [
-        remove_comments,
-        decode_string_escapes_in_code,
-        inline_simple_char_functions,
-        expand_string_char,
-        reverse_literals,
-        expand_static_table_concat,
-        merge_literal_concats,
-        propagate_simple_returns,
-        simplify_code,
-        normalize_operators,
-    ]
+    # Remove comments first.
+    code = remove_comments(code)
 
-    for _round in range(5):
-        before_round = code
+    evaluator = StaticLua()
 
-        for fn in passes:
-            before = code
+    # --------------------------------------------------------
+    # Repeated static analysis
+    # --------------------------------------------------------
 
-            try:
-                code = fn(code)
-            except Exception:
-                pass
-
-            stats["passes"] += 1
-
-            if code != before:
-                stats["changes"] += 1
-
-        tables = extract_tables(code)
-        constants = extract_constants(code, tables)
+    for round_no in range(20):
+        stats["rounds"] += 1
 
         before = code
 
-        try:
-            code = fold_expressions(
-                code,
-                constants,
-                tables
-            )
-        except Exception:
-            pass
+        evaluator.collect_functions(code)
 
-        if code != before:
+        # Resolve functions repeatedly.
+        evaluator.collect_assignments(code)
+
+        # Execute only the tiny static evaluator.
+        evaluator.unwrap_static_load(code)
+
+        # Expand load source.
+        new_code = evaluator.unwrap_static_load(
+            code
+        )
+
+        if new_code != code:
+            code = new_code
             stats["changes"] += 1
 
-        if code == before_round:
+            # Analyze generated Lua again.
+            continue
+
+        # Replace function calls.
+        new_code = collapse_calls(
+            code,
+            evaluator
+        )
+
+        if new_code != code:
+            code = new_code
+            stats["changes"] += 1
+
+        # Recalculate globals.
+        evaluator.collect_functions(code)
+        evaluator.collect_assignments(code)
+
+        # Substitute constants.
+        new_code = replace_known_constants(
+            code,
+            evaluator.env
+        )
+
+        # Do NOT replace "print" or keywords.
+        new_code = re.sub(
+            r'\bprint\b',
+            'print',
+            new_code
+        )
+
+        if new_code != code:
+            code = new_code
+            stats["changes"] += 1
+
+        # Remove redundant function definitions.
+        new_code = remove_redundant_functions(
+            code,
+            evaluator
+        )
+
+        if new_code != code:
+            code = new_code
+            stats["changes"] += 1
+
+        # Clean names only after resolution.
+        new_code = clean_names(code)
+
+        if new_code != code:
+            code = new_code
+            stats["changes"] += 1
+
+        # If no changes -> stable.
+        if code == before:
             break
 
-    # Final cleanup
-    code = simplify_code(code)
-    code = merge_literal_concats(code)
-    code = clean_generated_names(code)
-    code = normalize_operators(code)
-    code = format_lua(code)
+    stats["functions"] = len(
+        evaluator.functions
+    )
+
+    stats["constants"] = len(
+        evaluator.env
+    )
+
+    code = final_cleanup(code)
 
     return code, stats
+
+
+# ============================================================
+# FINAL CLEANUP
+# ============================================================
+
+def final_cleanup(code):
+    code = remove_comments(code)
+
+    # Remove blank lines around beginning/end.
+    code = re.sub(
+        r"^\s*\n+",
+        "",
+        code
+    )
+
+    code = re.sub(
+        r"\n+\s*$",
+        "\n",
+        code
+    )
+
+    # Spaces around commas.
+    code = re.sub(
+        r"\s*,\s*",
+        ", ",
+        code
+    )
+
+    # Operators.
+    code = re.sub(
+        r"\s*\.\.\s*",
+        " .. ",
+        code
+    )
+
+    code = re.sub(
+        r"\s*=\s*",
+        " = ",
+        code
+    )
+
+    # Don't destroy == / >= etc.
+    code = re.sub(
+        r"\s*=\s*(?!=)",
+        " = ",
+        code
+    )
+
+    # Multiple spaces.
+    code = re.sub(
+        r"[ \t]+",
+        " ",
+        code
+    )
+
+    # Keep newlines.
+    code = re.sub(
+        r" *\n *",
+        "\n",
+        code
+    )
+
+    # Duplicate blank lines.
+    code = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        code
+    )
+
+    # Simple indentation.
+    lines = code.splitlines()
+
+    result = []
+    indent = 0
+
+    for line in lines:
+        line = line.strip()
+
+        if not line:
+            if result and result[-1] != "":
+                result.append("")
+
+            continue
+
+        lower = line.lower()
+
+        if (
+            lower.startswith("end")
+            or lower.startswith("until")
+            or lower.startswith("else")
+            or lower.startswith("elseif")
+        ):
+            indent = max(
+                0,
+                indent - 1
+            )
+
+        result.append(
+            "    " * indent
+            + line
+        )
+
+        # Opening blocks.
+        if re.search(
+            r"\bthen\s*$",
+            line
+        ):
+            indent += 1
+
+        elif re.search(
+            r"\bdo\s*$",
+            line
+        ):
+            indent += 1
+
+        elif re.match(
+            r"^(local\s+)?function\b",
+            line
+        ) and not line.endswith("end"):
+            indent += 1
+
+        if lower.startswith(
+            "else"
+        ) or lower.startswith(
+            "elseif"
+        ):
+            indent += 1
+
+    return "\n".join(result).strip() + "\n"
 
 
 # ============================================================
 # ANALYSIS
 # ============================================================
 
-def analyze(source, result):
+def analyze_code(source):
     patterns = {
-        "string.char": r"string\s*\.\s*char\s*\(",
-        "string.byte": r"string\s*\.\s*byte\s*\(",
-        "string.reverse": r"string\s*\.\s*reverse\s*\(",
-        "string.rep": r"string\s*\.\s*rep\s*\(",
-        "string.sub": r"string\s*\.\s*sub\s*\(",
-        "string.format": r"string\s*\.\s*format\s*\(",
-        "table.concat": r"table\s*\.\s*concat\s*\(",
+        "string.char": r"\bstring\s*\.\s*char\s*\(",
+        "string.byte": r"\bstring\s*\.\s*byte\s*\(",
+        "string.reverse": r"\bstring\s*\.\s*reverse\s*\(",
+        "string.rep": r"\bstring\s*\.\s*rep\s*\(",
+        "string.sub": r"\bstring\s*\.\s*sub\s*\(",
+        "string.format": r"\bstring\s*\.\s*format\s*\(",
+        "table.concat": r"\btable\s*\.\s*concat\s*\(",
+        "table.insert": r"\btable\s*\.\s*insert\s*\(",
         "load": r"\bload\s*\(",
         "loadstring": r"\bloadstring\s*\(",
         "getfenv": r"\bgetfenv\s*\(",
@@ -1739,40 +2408,41 @@ def analyze(source, result):
         "debug": r"\bdebug\s*\.",
         "os": r"\bos\s*\.",
         "io": r"\bio\s*\.",
-        "hex escapes": r"\\x[0-9A-Fa-f]{2}",
-        "decimal escapes": r"\\\d{1,3}",
-        "huge numeric blocks": r"\b\d{6,}\b",
-        "hex numbers": r"0[xX][0-9A-Fa-f]+",
+        "string escapes": r"\\(?:x[0-9A-Fa-f]{2}|\d{1,3})",
+        "hex numbers": r"\b0[xX][0-9A-Fa-f]+\b",
+        "binary numbers": r"\b0[bB][01]+\b",
+        "hex variable names": r"\b_0[xX][0-9A-Fa-f]+\b",
     }
 
-    found = []
+    result = []
 
     for name, pattern in patterns.items():
-        count = len(re.findall(pattern, source))
+        count = len(
+            re.findall(
+                pattern,
+                source
+            )
+        )
 
         if count:
-            found.append((name, count))
+            result.append(
+                (name, count)
+            )
 
-    return found
+    return result
 
 
 # ============================================================
 # HTML
 # ============================================================
 
-def make_html(
+def create_html(
     filename,
     original,
     result,
     found,
     stats
 ):
-    original_escaped = html.escape(original)
-    result_escaped = html.escape(result)
-
-    original_size = len(original.encode("utf-8"))
-    result_size = len(result.encode("utf-8"))
-
     rows = ""
 
     for name, count in found:
@@ -1787,202 +2457,255 @@ def make_html(
         rows = (
             "<tr>"
             "<td colspan='2'>"
-            "Явные известные паттерны не найдены"
+            "No known patterns"
             "</td>"
             "</tr>"
         )
 
     return f"""<!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lua Deobfuscator — {html.escape(filename)}</title>
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>
+Lua Deobfuscator
+</title>
 
 <style>
 * {{
-    box-sizing: border-box;
+    box-sizing:border-box;
 }}
 
 body {{
-    margin: 0;
-    background: #090b10;
-    color: #e8eaf0;
+    margin:0;
+    background:#080a0f;
+    color:#e9edf5;
     font-family:
         Inter,
         system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
         sans-serif;
 }}
 
-.wrapper {{
-    width: min(1500px, 94%);
-    margin: 30px auto;
+.container {{
+    width:min(1500px,94%);
+    margin:30px auto;
 }}
 
 .header {{
-    background: #11151d;
-    border: 1px solid #242a35;
-    border-radius: 20px;
-    padding: 25px;
-    margin-bottom: 20px;
+    background:#11151c;
+    border:1px solid #252b36;
+    border-radius:22px;
+    padding:26px;
+    margin-bottom:20px;
 }}
 
 h1 {{
-    margin: 0 0 8px;
-    font-size: 28px;
+    margin:0;
+    font-size:30px;
 }}
 
-.subtitle {{
-    color: #8f98a8;
+.muted {{
+    color:#8b95a5;
+    margin-top:7px;
 }}
 
-.grid {{
-    display: grid;
+.cards {{
+    display:grid;
     grid-template-columns:
-        repeat(auto-fit, minmax(180px, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
+        repeat(auto-fit,minmax(180px,1fr));
+    gap:14px;
+    margin-bottom:20px;
 }}
 
 .card {{
-    background: #11151d;
-    border: 1px solid #242a35;
-    border-radius: 16px;
-    padding: 18px;
+    background:#11151c;
+    border:1px solid #252b36;
+    border-radius:18px;
+    padding:20px;
 }}
 
-.card .value {{
-    font-size: 25px;
-    font-weight: 800;
+.value {{
+    font-size:27px;
+    font-weight:800;
 }}
 
-.card .label {{
-    color: #858e9e;
-    margin-top: 5px;
+.label {{
+    color:#7f8999;
+    margin-top:5px;
 }}
 
 .panel {{
-    background: #11151d;
-    border: 1px solid #242a35;
-    border-radius: 20px;
-    overflow: hidden;
-    margin-bottom: 20px;
+    background:#11151c;
+    border:1px solid #252b36;
+    border-radius:20px;
+    margin-bottom:20px;
+    overflow:hidden;
 }}
 
-.panel-title {{
-    padding: 18px 20px;
-    font-weight: 800;
-    border-bottom: 1px solid #242a35;
+.title {{
+    padding:17px 20px;
+    border-bottom:1px solid #252b36;
+    font-weight:800;
 }}
 
 pre {{
-    margin: 0;
-    padding: 22px;
-    overflow-x: auto;
+    margin:0;
+    padding:22px;
+    overflow:auto;
     font-family:
         "JetBrains Mono",
-        "Cascadia Code",
         Consolas,
         monospace;
-    font-size: 13px;
-    line-height: 1.65;
-    white-space: pre;
+    font-size:13px;
+    line-height:1.65;
+    white-space:pre;
 }}
 
 table {{
-    width: 100%;
-    border-collapse: collapse;
+    width:100%;
+    border-collapse:collapse;
 }}
 
 td {{
-    padding: 13px 18px;
-    border-bottom: 1px solid #202631;
+    padding:13px 18px;
+    border-bottom:1px solid #202631;
 }}
 
 td:last-child {{
-    text-align: right;
-    font-weight: 700;
+    text-align:right;
+    font-weight:800;
 }}
 
 .badge {{
-    display: inline-block;
-    padding: 6px 10px;
-    border-radius: 9px;
-    background: #191f2a;
-    color: #aeb8c8;
-    font-size: 12px;
+    display:inline-block;
+    margin-left:8px;
+    padding:4px 8px;
+    border-radius:8px;
+    background:#1a202b;
+    color:#9da8ba;
+    font-size:11px;
 }}
 
 .footer {{
-    color: #697384;
-    text-align: center;
-    padding: 20px;
+    text-align:center;
+    color:#697383;
+    padding:25px;
 }}
 </style>
 </head>
 
 <body>
-<div class="wrapper">
+
+<div class="container">
 
 <div class="header">
-    <h1>Lua Deobfuscator</h1>
-    <div class="subtitle">
-        {html.escape(filename)}
-    </div>
+<h1>Lua Static Deobfuscator</h1>
+<div class="muted">
+{html.escape(filename)}
+</div>
 </div>
 
-<div class="grid">
+<div class="cards">
 
 <div class="card">
-    <div class="value">{original_size:,}</div>
-    <div class="label">Original bytes</div>
+<div class="value">
+{len(original.encode("utf-8")):,}
 </div>
-
-<div class="card">
-    <div class="value">{result_size:,}</div>
-    <div class="label">Result bytes</div>
+<div class="label">
+Original bytes
 </div>
-
-<div class="card">
-    <div class="value">{stats["passes"]}</div>
-    <div class="label">Static passes</div>
 </div>
 
 <div class="card">
-    <div class="value">{stats["changes"]}</div>
-    <div class="label">Changed passes</div>
+<div class="value">
+{len(result.encode("utf-8")):,}
+</div>
+<div class="label">
+Result bytes
+</div>
+</div>
+
+<div class="card">
+<div class="value">
+{stats["rounds"]}
+</div>
+<div class="label">
+Analysis rounds
+</div>
+</div>
+
+<div class="card">
+<div class="value">
+{stats["changes"]}
+</div>
+<div class="label">
+Transformations
+</div>
+</div>
+
+<div class="card">
+<div class="value">
+{stats["functions"]}
+</div>
+<div class="label">
+Functions discovered
+</div>
+</div>
+
+<div class="card">
+<div class="value">
+{stats["constants"]}
+</div>
+<div class="label">
+Constants discovered
+</div>
 </div>
 
 </div>
 
 <div class="panel">
-<div class="panel-title">Detected patterns</div>
+
+<div class="title">
+Detected obfuscation
+</div>
+
 <table>
 {rows}
 </table>
+
 </div>
 
 <div class="panel">
-<div class="panel-title">
+
+<div class="title">
 Deobfuscated Lua
-<span class="badge">STATIC</span>
+<span class="badge">
+STATIC
+</span>
 </div>
-<pre>{result_escaped}</pre>
+
+<pre>{html.escape(result)}</pre>
+
 </div>
 
 <div class="panel">
-<div class="panel-title">Original Lua</div>
-<pre>{original_escaped}</pre>
+
+<div class="title">
+Original Lua
+</div>
+
+<pre>{html.escape(original)}</pre>
+
 </div>
 
 <div class="footer">
-Generated by Lua Static Deobfuscator
+Lua Static Deobfuscator
 </div>
 
 </div>
+
 </body>
 </html>
 """
@@ -1992,13 +2715,12 @@ Generated by Lua Static Deobfuscator
 # FILE READER
 # ============================================================
 
-def read_file(path):
+def read_lua(path):
     data = Path(path).read_bytes()
 
     if len(data) > MAX_FILE_SIZE:
         raise ValueError(
-            f"Файл слишком большой: "
-            f"{len(data) / 1024 / 1024:.2f} MB"
+            "File exceeds 10 MB"
         )
 
     encodings = [
@@ -2011,172 +2733,211 @@ def read_file(path):
         "latin-1",
     ]
 
-    last_error = None
-
     for encoding in encodings:
         try:
-            text = data.decode(encoding)
+            text = data.decode(
+                encoding
+            )
 
-            if "\x00" in text and encoding not in {
-                "utf-16",
-                "utf-16-le",
-                "utf-16-be",
-            }:
+            if (
+                "\x00" in text
+                and encoding not in {
+                    "utf-16",
+                    "utf-16-le",
+                    "utf-16-be"
+                }
+            ):
                 continue
 
             return text
 
-        except UnicodeDecodeError as e:
-            last_error = e
+        except UnicodeDecodeError:
+            pass
 
     raise ValueError(
-        f"Не удалось определить кодировку: {last_error}"
+        "Unknown Lua file encoding"
     )
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM HANDLERS
 # ============================================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def start(message: Message):
     await message.answer(
-        "👋 Отправь мне Lua-файл (.lua или .txt).\n\n"
-        "Я проведу статический анализ, "
-        "расшифрую доступные константы и "
-        "верну HTML с результатом.\n\n"
-        "⚠️ Загруженный Lua-код не запускается."
+        "🧩 Lua Deobfuscator\n\n"
+        "Отправь мне .lua файл.\n\n"
+        "Я статически разбираю его, "
+        "раскрываю доступные декодеры, "
+        "константы, таблицы и выражения "
+        "и возвращаю HTML.\n\n"
+        "⚠️ Сам загруженный Lua-код "
+        "не запускается."
     )
 
 
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
+async def help_command(message: Message):
     await message.answer(
-        "📦 Поддерживается Lua/Lua-обфускация.\n\n"
-        "Отправь .lua файл документом.\n\n"
-        "Бот выполняет статическую обработку:\n"
+        "Поддерживаются статические конструкции:\n\n"
+        "• функции-декодеры\n"
+        "• local constants\n"
+        "• таблицы\n"
+        "• table[index]\n"
+        "• #table\n"
+        "• numeric for\n"
         "• string.char\n"
         "• string.byte\n"
-        "• reverse\n"
-        "• concat\n"
-        "• escapes\n"
-        "• арифметику\n"
-        "• константы\n"
-        "• таблицы\n"
-        "• простые decoder-функции\n"
-        "• очистку имён\n"
-        "• форматирование\n\n"
-        "Код не выполняется."
+        "• string.reverse\n"
+        "• string.sub\n"
+        "• string.rep\n"
+        "• string.format\n"
+        "• table.concat\n"
+        "• table.insert\n"
+        "• tonumber\n"
+        "• tostring\n"
+        "• арифметика\n"
+        "• concatenation\n"
+        "• static load generation\n"
+        "• очистка _0x имен\n"
+        "• повторный анализ"
     )
 
 
 @dp.message(F.document)
-async def handle_document(message: Message):
+async def document_handler(
+    message: Message
+):
     document = message.document
 
     if not document:
         return
 
-    filename = document.file_name or "script.lua"
+    filename = (
+        document.file_name
+        or "script.lua"
+    )
 
-    extension = Path(filename).suffix.lower()
+    extension = (
+        Path(filename)
+        .suffix
+        .lower()
+    )
 
-    if extension not in {".lua", ".txt"}:
+    if extension not in {
+        ".lua",
+        ".txt"
+    }:
         await message.answer(
-            "❌ Отправь файл с расширением .lua или .txt"
+            "❌ Нужен .lua или .txt файл."
         )
         return
 
     await message.answer(
-        "🔎 Анализирую Lua...\n"
-        "Это может занять некоторое время."
+        "🔬 Разбираю Lua...\n"
+        "Файл не будет выполнен."
     )
 
-    temp_in = None
-    temp_out = None
+    input_path = None
+    output_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
+        fd, input_path = tempfile.mkstemp(
             suffix=".lua"
-        ) as f:
-            temp_in = f.name
+        )
+
+        os.close(fd)
 
         await bot.download(
             document,
-            destination=temp_in
+            destination=input_path
         )
 
-        original = read_file(temp_in)
+        original = read_lua(
+            input_path
+        )
 
         if not original.strip():
-            raise ValueError("Файл пустой")
+            raise ValueError(
+                "Empty file"
+            )
 
-        result, stats = deobfuscate(original)
-
-        if not result.strip():
-            result = original
-
-        patterns = analyze(
-            original,
-            result
+        result, stats = deobfuscate(
+            original
         )
 
-        safe_name = re.sub(
+        found = analyze_code(
+            original
+        )
+
+        stem = Path(
+            filename
+        ).stem
+
+        stem = re.sub(
             r"[^A-Za-z0-9_.-]+",
             "_",
-            Path(filename).stem
+            stem
         )
 
         html_name = (
-            f"{safe_name}_deobfuscated.html"
+            stem
+            + "_deobfuscated.html"
         )
 
-        html_path = Path(
-            tempfile.gettempdir()
-        ) / html_name
+        output_path = str(
+            Path(
+                tempfile.gettempdir()
+            ) / html_name
+        )
 
-        html_content = make_html(
+        content = create_html(
             filename,
             original,
             result,
-            patterns,
+            found,
             stats
         )
 
-        html_path.write_text(
-            html_content,
+        Path(
+            output_path
+        ).write_text(
+            content,
             encoding="utf-8"
         )
 
-        temp_out = str(html_path)
-
         await message.answer_document(
             FSInputFile(
-                temp_out,
+                output_path,
                 filename=html_name
             ),
             caption=(
                 "✅ Готово\n\n"
                 f"📄 {filename}\n"
-                f"🔄 Проходов: {stats['passes']}\n"
+                f"🔄 Раундов: {stats['rounds']}\n"
+                f"🧩 Функций: {stats['functions']}\n"
+                f"🔢 Констант: {stats['constants']}\n"
                 f"✨ Изменений: {stats['changes']}\n\n"
-                "Результат находится внутри HTML."
+                "Lua-код не выполнялся."
             )
         )
 
     except Exception as e:
         logging.exception(
-            "Deobfuscation error"
+            "DEOBFUSCATION ERROR"
         )
 
         await message.answer(
-            "❌ Ошибка обработки\n\n"
+            "❌ Ошибка:\n\n"
             f"{type(e).__name__}: {e}"
         )
 
     finally:
-        for path in [temp_in, temp_out]:
+        for path in [
+            input_path,
+            output_path
+        ]:
             if path:
                 try:
                     Path(path).unlink(
@@ -2187,24 +2948,28 @@ async def handle_document(message: Message):
 
 
 @dp.message()
-async def fallback(message: Message):
+async def fallback(
+    message: Message
+):
     await message.answer(
-        "📎 Отправь Lua-файл документом."
+        "📎 Отправь Lua-файл "
+        "как документ."
     )
 
 
 # ============================================================
-# HEALTH SERVER
+# RENDER HEALTH
 # ============================================================
 
-async def health(request):
+async def health(
+    request
+):
     return web.Response(
-        text="OK",
-        status=200
+        text="OK"
     )
 
 
-async def start_web():
+async def start_http():
     app = web.Application()
 
     app.router.add_get(
@@ -2217,7 +2982,10 @@ async def start_web():
         health
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
+
     await runner.setup()
 
     site = web.TCPSite(
@@ -2229,7 +2997,7 @@ async def start_web():
     await site.start()
 
     logging.info(
-        "HTTP server started on port %s",
+        "HTTP server: %s",
         PORT
     )
 
@@ -2240,20 +3008,18 @@ async def start_web():
 
 async def main():
     logging.info(
-        "Starting Lua Deobfuscator..."
+        "Starting advanced Lua deobfuscator"
     )
 
-    await start_web()
+    await start_http()
 
     await bot.delete_webhook(
         drop_pending_updates=True
     )
 
-    logging.info(
-        "Telegram polling started"
+    await dp.start_polling(
+        bot
     )
-
-    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
