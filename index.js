@@ -5,38 +5,43 @@ require("dotenv").config();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 if (!BOT_TOKEN) {
-  console.error("Ошибка: BOT_TOKEN не найден в Environment Variables");
+  console.error("❌ BOT_TOKEN не найден в Environment Variables");
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-//
+// =====================================================
 // КАРТИНКИ
-// Можно оставить пустыми.
-// Для Telegram нужны прямые ссылки на изображения или file_id.
-//
-const IMG_START = process.env.IMG_START || "";
-const IMG_CONFIRM = process.env.IMG_CONFIRM || "";
-const IMG_SEARCH = process.env.IMG_SEARCH || "";
-const IMG_SUCCESS = process.env.IMG_SUCCESS || "";
-const IMG_FAIL = process.env.IMG_FAIL || "";
+// ВАЖНО: это твои ссылки. ENV для картинок НЕ нужен.
+// Если Telegram не примет страницу ibb.co,
+// sendImage автоматически отправит обычный текст.
+// =====================================================
 
-//
-// Состояния пользователей
-//
+const IMG_START = "https://ibb.co/DHv4fmT5";
+const IMG_CONFIRM = "https://ibb.co/ycVd98zr";
+const IMG_SEARCH = "https://ibb.co/dsGy2BDh";
+const IMG_SUCCESS = "https://ibb.co/84cfh00b";
+const IMG_FAIL = "https://ibb.co/V0bdcbDX";
+
+// =====================================================
+// СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ
+// =====================================================
+
 const users = new Map();
 
-//
-// Проверка email
-//
+// =====================================================
+// ПРОВЕРКА EMAIL
+// =====================================================
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(email);
 }
 
-//
-// Защита HTML
-//
+// =====================================================
+// ЗАЩИТА HTML
+// =====================================================
+
 function escapeHtml(text) {
   return String(text)
     .replace(/&/g, "&amp;")
@@ -45,29 +50,37 @@ function escapeHtml(text) {
     .replace(/"/g, "&quot;");
 }
 
-//
-// Отправка картинки.
-// Если картинка не задана или Telegram не смог её загрузить,
-// бот автоматически отправит обычное сообщение.
-//
+// =====================================================
+// ОТПРАВКА КАРТИНКИ
+// =====================================================
+
 async function sendImage(ctx, image, caption, extra = {}) {
   if (image) {
     try {
-      return await ctx.replyWithPhoto(image, {
-        caption,
-        ...extra
-      });
+      await ctx.replyWithPhoto(
+        { url: image },
+        {
+          caption,
+          ...extra
+        }
+      );
+
+      return;
     } catch (error) {
-      console.log("Не удалось отправить изображение:", error.message);
+      console.log(
+        "⚠️ Картинка не загрузилась:",
+        error.message
+      );
     }
   }
 
-  return await ctx.reply(caption, extra);
+  await ctx.reply(caption, extra);
 }
 
-//
-// Главное меню
-//
+// =====================================================
+// ГЛАВНОЕ МЕНЮ
+// =====================================================
+
 function mainMenu() {
   return Markup.inlineKeyboard([
     [
@@ -79,9 +92,10 @@ function mainMenu() {
   ]);
 }
 
-//
-// /start
-//
+// =====================================================
+// /START
+// =====================================================
+
 bot.start(async (ctx) => {
   users.set(ctx.chat.id, {
     step: "start"
@@ -95,9 +109,10 @@ bot.start(async (ctx) => {
   );
 });
 
-//
-// Кнопка проверки
-//
+// =====================================================
+// ПРОВЕРКА EMAIL
+// =====================================================
+
 bot.action("probit_email", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
@@ -111,18 +126,25 @@ bot.action("probit_email", async (ctx) => {
     "Вы точно подтверждаете свои действия?\n\nЕсли да — нажмите кнопку ниже.",
     Markup.inlineKeyboard([
       [
-        Markup.button.callback("Да", "confirm_yes")
+        Markup.button.callback(
+          "Да",
+          "confirm_yes"
+        )
       ],
       [
-        Markup.button.callback("Отмена", "confirm_no")
+        Markup.button.callback(
+          "Отмена",
+          "confirm_no"
+        )
       ]
     ])
   );
 });
 
-//
-// Подтверждение
-//
+// =====================================================
+// ПОДТВЕРЖДЕНИЕ
+// =====================================================
+
 bot.action("confirm_yes", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
@@ -130,14 +152,13 @@ bot.action("confirm_yes", async (ctx) => {
     step: "await_email"
   });
 
-  await ctx.reply(
-    "Введите email:"
-  );
+  await ctx.reply("Введите email:");
 });
 
-//
-// Отмена
-//
+// =====================================================
+// ОТМЕНА
+// =====================================================
+
 bot.action("confirm_no", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
@@ -151,9 +172,24 @@ bot.action("confirm_no", async (ctx) => {
   );
 });
 
-//
-// Получение email
-//
+// =====================================================
+// НОВЫЙ ПОИСК
+// =====================================================
+
+bot.action("new_search", async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+
+  users.set(ctx.chat.id, {
+    step: "await_email"
+  });
+
+  await ctx.reply("Введите email:");
+});
+
+// =====================================================
+// ПОЛУЧЕНИЕ EMAIL
+// =====================================================
+
 bot.on("text", async (ctx) => {
   const chatId = ctx.chat.id;
   const state = users.get(chatId);
@@ -166,11 +202,15 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  const email = ctx.message.text.trim().toLowerCase();
+  const email =
+    ctx.message.text
+      .trim()
+      .toLowerCase();
 
-  //
-  // Проверяем формат
-  //
+  // -----------------------------------------------
+  // ПРОВЕРКА ФОРМАТА
+  // -----------------------------------------------
+
   if (!isValidEmail(email)) {
     await ctx.reply(
       "Некорректный email.\n\nПопробуйте ещё раз:"
@@ -179,33 +219,38 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  // -----------------------------------------------
+  // СОСТОЯНИЕ ПОИСКА
+  // -----------------------------------------------
+
   users.set(chatId, {
     step: "searching"
   });
 
-  //
-  // Экран поиска
-  //
+  // -----------------------------------------------
+  // КАРТИНКА ПОИСКА
+  // -----------------------------------------------
+
   await sendImage(
     ctx,
     IMG_SEARCH,
-    "Начинаю проверку..."
+    "Начинается проверка по базам..."
   );
 
-  //
-  // Небольшая задержка для отображения процесса
-  //
+  // -----------------------------------------------
+  // ЗАДЕРЖКА
+  // -----------------------------------------------
+
   await new Promise((resolve) => {
     setTimeout(resolve, 1000);
   });
 
+  // -----------------------------------------------
+  // СТАРАЯ ЛОГИКА
+  // -----------------------------------------------
+
   const domain = email.split("@")[1];
 
-  //
-  // Короткий результат.
-  // Здесь намеренно нет огромного JSON и перебора
-  // сторонних аккаунтов.
-  //
   const resultText =
     "<b>Результат проверки</b>\n\n" +
     "Email: <code>" +
@@ -216,11 +261,19 @@ bot.on("text", async (ctx) => {
     "</code>\n" +
     "Формат: корректный";
 
+  // -----------------------------------------------
+  // КАРТИНКА РЕЗУЛЬТАТА
+  // -----------------------------------------------
+
   await sendImage(
     ctx,
     IMG_SUCCESS,
     "Проверка завершена."
   );
+
+  // -----------------------------------------------
+  // РЕЗУЛЬТАТ
+  // -----------------------------------------------
 
   await ctx.reply(
     resultText,
@@ -236,7 +289,7 @@ bot.on("text", async (ctx) => {
         [
           Markup.button.callback(
             "Новый поиск",
-            "probit_email"
+            "new_search"
           )
         ]
       ])
@@ -248,61 +301,101 @@ bot.on("text", async (ctx) => {
   });
 });
 
-//
-// HTTP-сервер для Render
-//
-// Render Web Service требует открытый порт.
-//
-const PORT = Number(process.env.PORT) || 3000;
+// =====================================================
+// ОБРАБОТКА НЕПРЕДУСМОТРЕННЫХ ОШИБОК
+// =====================================================
 
-const server = http.createServer((req, res) => {
-  if (req.url === "/" || req.url === "/health") {
-    res.writeHead(200, {
-      "Content-Type": "text/plain; charset=utf-8"
-    });
-
-    res.end("Bot is running");
-    return;
-  }
-
-  res.writeHead(404, {
-    "Content-Type": "text/plain; charset=utf-8"
-  });
-
-  res.end("Not Found");
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `HTTP server started on port ${PORT}`
+bot.catch((error, ctx) => {
+  console.error(
+    "Ошибка Telegram:",
+    error?.message || error
   );
 });
 
-//
-// Запуск Telegram-бота
-//
-bot.launch()
-  .then(() => {
-    console.log("Telegram bot started successfully");
-  })
-  .catch((error) => {
+// =====================================================
+// HTTP SERVER ДЛЯ RENDER
+// =====================================================
+
+const PORT =
+  Number(process.env.PORT) || 3000;
+
+const server = http.createServer(
+  (req, res) => {
+    if (
+      req.url === "/" ||
+      req.url === "/health"
+    ) {
+      res.writeHead(200, {
+        "Content-Type":
+          "text/plain; charset=utf-8"
+      });
+
+      res.end("Bot is running");
+      return;
+    }
+
+    res.writeHead(404, {
+      "Content-Type":
+        "text/plain; charset=utf-8"
+    });
+
+    res.end("Not Found");
+  }
+);
+
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `HTTP server started on port ${PORT}`
+    );
+  }
+);
+
+// =====================================================
+// ЗАПУСК TELEGRAM
+// =====================================================
+
+(async () => {
+  try {
+    console.log(
+      "🚀 Запуск Telegram бота..."
+    );
+
+    await bot.launch({
+      dropPendingUpdates: true
+    });
+
+    console.log(
+      "✅ Telegram bot started successfully"
+    );
+  } catch (error) {
     console.error(
-      "Telegram bot startup error:",
+      "❌ Telegram bot startup error:",
       error
     );
 
     process.exit(1);
-  });
+  }
+})();
 
-//
-// Корректное завершение
-//
-process.once("SIGINT", () => {
-  bot.stop("SIGINT");
-  server.close();
-});
+// =====================================================
+// КОРРЕКТНОЕ ЗАВЕРШЕНИЕ
+// =====================================================
 
-process.once("SIGTERM", () => {
-  bot.stop("SIGTERM");
-  server.close();
-});
+process.once(
+  "SIGINT",
+  () => {
+    bot.stop("SIGINT");
+    server.close();
+  }
+);
+
+process.once(
+  "SIGTERM",
+  () => {
+    bot.stop("SIGTERM");
+    server.close();
+  }
+);
