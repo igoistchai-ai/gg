@@ -1,17 +1,11 @@
 import os
 import re
+import io
 import ast
-import base64
-import random
-import string
-import tempfile
-import threading
 import asyncio
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import uvicorn
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -30,385 +24,213 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not configured")
+    raise RuntimeError("BOT_TOKEN is not set")
 
-PORT = int(os.getenv("PORT", "10000"))
+MAX_FILE_SIZE = 5 * 1024 * 1024
 
-app = FastAPI()
-
-# user_id -> uploaded Lua source
-PENDING = {}
+# user_id -> selected mode
+USER_MODE = {}
 
 # ============================================================
-# HEALTH SERVER
+# RENDER HEALTH SERVER
 # ============================================================
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "Lua Obfuscator Bot"
-    }
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
 
 
-@app.get("/health")
-async def health():
-    return JSONResponse({
-        "status": "ok"
-    })
-
-
-def run_web():
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
-
-
-# ============================================================
-# RANDOM UTILITIES
-# ============================================================
-
-def rnd_name(length=12):
-    alphabet = string.ascii_letters
-    return "_" + "".join(random.choice(alphabet) for _ in range(length))
-
-
-def rnd_key():
-    return random.randint(15, 240)
-
-
-def lua_quote(s):
-    return '"' + (
-        s.replace("\\", "\\\\")
-         .replace('"', '\\"')
-         .replace("\r", "\\r")
-         .replace("\n", "\\n")
-         .replace("\t", "\\t")
-    ) + '"'
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
 # ============================================================
-# LUA STRING LEXER
+# SAFE RANDOM NAME
 # ============================================================
 
-def scan_strings(source):
+def random_name(prefix="_"):
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return prefix + "".join(secrets.choice(alphabet) for _ in range(14))
+
+
+# ============================================================
+# LUA STRING PARSER
+# ============================================================
+
+def decode_lua_string(raw):
     """
-    Находит обычные Lua-строки.
-    Не пытается менять содержимое внутри комментариев.
+    Converts the content of a normal Lua quoted string into bytes.
+
+    Supports:
+      \\n
+      \\r
+      \\t
+      \\b
+      \\f
+      \\v
+      \\\\
+      \\"
+      \\'
+      \\ddd
+      \\xXX
+
+    If something unusual is encountered, the original
+    literal is returned unchanged by the caller.
     """
 
-    result = []
+    if len(raw) < 2:
+        return None
+
+    quote = raw[0]
+
+    if quote not in ("'", '"') or raw[-1] != quote:
+        return None
+
+    s = raw[1:-1]
+    out = bytearray()
+
     i = 0
-    n = len(source)
 
-    while i < n:
-        c = source[i]
+    while i < len(s):
+        c = s[i]
 
-        # single / double quote
-        if c == '"' or c == "'":
-            quote = c
-            start = i
+        if c != "\\":
+            encoded = c.encode("utf-8")
+            out.extend(encoded)
             i += 1
-
-            escaped = False
-
-            while i < n:
-                ch = source[i]
-
-                if escaped:
-                    escaped = False
-                    i += 1
-                    continue
-
-                if ch == "\\":
-                    escaped = True
-                    i += 1
-                    continue
-
-                if ch == quote:
-                    i += 1
-                    break
-
-                i += 1
-
-            result.append(
-                (
-                    start,
-                    i,
-                    source[start:i]
-                )
-            )
-
-            continue
-
-        # Lua long string
-        if source.startswith("[[", i):
-            start = i
-            end = source.find("]]", i + 2)
-
-            if end != -1:
-                end += 2
-                result.append(
-                    (
-                        start,
-                        end,
-                        source[start:end]
-                    )
-                )
-                i = end
-                continue
-
-        # comment
-        if source.startswith("--", i):
-            # long comment
-            if source.startswith("--[[", i):
-                end = source.find("]]", i + 4)
-
-                if end == -1:
-                    break
-
-                i = end + 2
-                continue
-
-            # normal comment
-            end = source.find("\n", i + 2)
-
-            if end == -1:
-                break
-
-            i = end
             continue
 
         i += 1
 
-    return result
+        if i >= len(s):
+            return None
+
+        c = s[i]
+
+        escapes = {
+            "a": 7,
+            "b": 8,
+            "f": 12,
+            "n": 10,
+            "r": 13,
+            "t": 9,
+            "v": 11,
+            "\\": 92,
+            '"': 34,
+            "'": 39,
+        }
+
+        if c in escapes:
+            out.append(escapes[c])
+            i += 1
+            continue
+
+        # \ddd
+        if c.isdigit():
+            digits = c
+            i += 1
+
+            for _ in range(2):
+                if i < len(s) and s[i].isdigit():
+                    digits += s[i]
+                    i += 1
+                else:
+                    break
+
+            value = int(digits)
+
+            if value > 255:
+                return None
+
+            out.append(value)
+            continue
+
+        # \xXX
+        if c == "x":
+            if i + 2 >= len(s):
+                return None
+
+            hx = s[i + 1:i + 3]
+
+            if not re.fullmatch(r"[0-9a-fA-F]{2}", hx):
+                return None
+
+            out.append(int(hx, 16))
+            i += 3
+            continue
+
+        # escaped newline
+        if c == "\n":
+            out.append(10)
+            i += 1
+            continue
+
+        if c == "\r":
+            if i + 1 < len(s) and s[i + 1] == "\n":
+                i += 1
+
+            out.append(10)
+            i += 1
+            continue
+
+        # Unknown escape:
+        # preserve the backslash literally.
+        out.append(ord("\\"))
+        encoded = c.encode("utf-8")
+        out.extend(encoded)
+        i += 1
+
+    return bytes(out)
 
 
 # ============================================================
-# DECODE LUA STRING
+# STRING ENCODING
 # ============================================================
 
-def decode_lua_string(token):
-    if len(token) < 2:
-        return None
+def string_expression(data, variable):
+    """
+    Creates a runtime expression that reconstructs a string.
 
-    if token[0] not in "\"'":
-        return None
+    It doesn't use load/loadstring.
+    """
 
-    try:
-        # Lua escapes mostly overlap with Python here.
-        return ast.literal_eval(token)
-    except Exception:
-        return None
+    numbers = ",".join(str(x) for x in data)
 
-
-# ============================================================
-# STRING ENCRYPTION
-# ============================================================
-
-def xor_bytes(data, key):
-    return bytes(
-        b ^ key
-        for b in data
+    return (
+        f"(function({variable})"
+        f"local _t={{}};"
+        f"for _i=1,#{variable} do "
+        f"_t[_i]=string.char({variable}[_i]) "
+        f"end;"
+        f"return table.concat(_t)"
+        f"end)({{{numbers}}})"
     )
 
 
-def make_string_runtime():
-    """
-    Генерирует Lua runtime для декодирования строк.
-    """
-
-    a = rnd_name()
-    b = rnd_name()
-    c = rnd_name()
-    d = rnd_name()
-    e = rnd_name()
-
-    runtime = f"""
-local {a} = string.char
-local {b} = table.concat
-
-local function {c}({d},{e})
-    local _r = {{}}
-    for _i = 1, #{d} do
-        _r[_i] = {a}({d}[_i] ~ {e})
-    end
-    return {b}(_r)
-end
-"""
-
-    return runtime, c
-
-
-def encrypt_strings(source):
-    """
-    Заменяет строки на вызовы декодера.
-    """
-
-    locations = scan_strings(source)
-
-    if not locations:
-        return source
-
-    runtime, decoder = make_string_runtime()
-
-    replacements = []
-
-    for start, end, token in locations:
-        value = decode_lua_string(token)
-
-        if value is None:
-            continue
-
-        # Не трогаем пустые строки
-        if value == "":
-            continue
-
-        key = rnd_key()
-
-        encoded = [
-            b ^ key
-            for b in value.encode("utf-8")
-        ]
-
-        table = ",".join(str(x) for x in encoded)
-
-        replacement = f"{decoder}({{{table}}},{key})"
-
-        replacements.append(
-            (
-                start,
-                end,
-                replacement
-            )
-        )
-
-    if not replacements:
-        return source
-
-    out = source
-
-    for start, end, replacement in reversed(replacements):
-        out = (
-            out[:start]
-            + replacement
-            + out[end:]
-        )
-
-    return runtime + "\n" + out
-
-
 # ============================================================
-# NUMBER OBFUSCATION
+# LEXER
 # ============================================================
 
-NUMBER_RE = re.compile(
-    r"(?<![\w.])"
-    r"(0[xX][0-9a-fA-F]+|"
-    r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
-    r"(?![\w.])"
-)
+IDENTIFIER_START = re.compile(r"[A-Za-z_]")
+IDENTIFIER_BODY = re.compile(r"[A-Za-z0-9_]")
 
-
-def obfuscate_numbers(source):
-    """
-    123 -> (100 + 23)
-    500 -> (700 - 200)
-
-    Только для простых десятичных чисел.
-    """
-
-    locations = scan_strings(source)
-
-    protected = []
-
-    for a, b, _ in locations:
-        protected.append((a, b))
-
-    def inside_protected(pos):
-        for a, b in protected:
-            if a <= pos < b:
-                return True
-        return False
-
-    matches = list(NUMBER_RE.finditer(source))
-
-    replacements = []
-
-    for m in matches:
-        if inside_protected(m.start()):
-            continue
-
-        token = m.group(1)
-
-        # hex не меняем
-        if token.lower().startswith("0x"):
-            continue
-
-        # Не трогаем слишком большие/сложные числа
-        try:
-            value = float(token)
-
-            if not value.is_integer():
-                continue
-
-            value = int(value)
-
-        except Exception:
-            continue
-
-        # маленькие числа оставляем
-        if abs(value) <= 2:
-            continue
-
-        mode = random.randint(0, 2)
-
-        if mode == 0:
-            a = random.randint(1, max(1, abs(value)))
-            b = value - a
-
-            replacement = f"({a}+({b}))"
-
-        elif mode == 1:
-            a = value + random.randint(1, 100)
-            b = a - value
-
-            replacement = f"({a}-({b}))"
-
-        else:
-            k = random.randint(2, 9)
-            a = value * k
-
-            replacement = f"(({a})/{k})"
-
-        replacements.append(
-            (
-                m.start(),
-                m.end(),
-                replacement
-            )
-        )
-
-    out = source
-
-    for start, end, replacement in reversed(replacements):
-        out = (
-            out[:start]
-            + replacement
-            + out[end:]
-        )
-
-    return out
-
-
-# ============================================================
-# IDENTIFIER RENAMING
-# ============================================================
-
-LUA_KEYWORDS = {
+KEYWORDS = {
     "and",
     "break",
     "do",
@@ -431,805 +253,996 @@ LUA_KEYWORDS = {
     "true",
     "until",
     "while",
+    "continue",
+    "type",
+    "export",
 }
 
-PROTECTED_GLOBALS = {
-    "print",
+# Roblox/Luau names that must never be renamed.
+PROTECTED_NAMES = {
+    "game",
+    "workspace",
+    "script",
+    "shared",
+    "_G",
+
+    "Enum",
+    "Instance",
+    "Vector2",
+    "Vector3",
+    "CFrame",
+    "Color3",
+    "UDim",
+    "UDim2",
+    "BrickColor",
+    "Ray",
+    "Random",
+    "TweenInfo",
+
+    "task",
+    "coroutine",
+    "debug",
+    "math",
+    "string",
+    "table",
+    "bit32",
+    "utf8",
+    "os",
+
     "pairs",
     "ipairs",
     "next",
-    "type",
-    "tostring",
-    "tonumber",
     "select",
-    "assert",
-    "error",
+    "unpack",
     "pcall",
     "xpcall",
+    "error",
+    "assert",
+    "warn",
+    "print",
+    "tostring",
+    "tonumber",
+    "type",
+    "typeof",
+    "rawget",
+    "rawset",
+    "rawequal",
+    "rawlen",
+    "setmetatable",
+    "getmetatable",
+
     "require",
-    "load",
-    "loadstring",
-    "string",
-    "table",
-    "math",
-    "os",
-    "io",
-    "coroutine",
-    "debug",
-    "utf8",
-    "bit32",
-    "_G",
-    "_VERSION",
-    "self",
+
+    "wait",
+    "spawn",
+    "delay",
+
+    "getgenv",
+    "getrenv",
+    "getsenv",
+    "getgc",
+    "gethui",
+    "getconnections",
+    "hookfunction",
+    "hookmetamethod",
+    "newcclosure",
+    "checkcaller",
+    "iscclosure",
+    "islclosure",
+    "identifyexecutor",
+    "setclipboard",
+
+    "http",
+    "request",
+    "http_request",
+    "syn",
+    "fluxus",
+    "krnl",
+
+    "Players",
+    "LocalPlayer",
+    "ReplicatedStorage",
+    "ReplicatedFirst",
+    "ServerScriptService",
+    "ServerStorage",
+    "StarterGui",
+    "StarterPlayer",
+    "Lighting",
+    "RunService",
+    "UserInputService",
+    "TweenService",
+    "HttpService",
+    "TeleportService",
+    "CoreGui",
 }
 
 
-IDENT_RE = re.compile(
-    r"\b[A-Za-z_][A-Za-z0-9_]*\b"
+def is_identifier_start(c):
+    return bool(c) and bool(IDENTIFIER_START.match(c))
+
+
+def is_identifier_char(c):
+    return bool(c) and bool(IDENTIFIER_BODY.match(c))
+
+
+# ============================================================
+# LONG STRING DETECTION
+# ============================================================
+
+def read_long_bracket(src, pos):
+    """
+    Reads Lua long strings/comments:
+
+    [[ ... ]]
+    [=[ ... ]=]
+    [==[ ... ]==]
+
+    Returns (end_position, content) or None.
+    """
+
+    if pos >= len(src) or src[pos] != "[":
+        return None
+
+    i = pos + 1
+    eq = 0
+
+    while i < len(src) and src[i] == "=":
+        eq += 1
+        i += 1
+
+    if i >= len(src) or src[i] != "[":
+        return None
+
+    close = "]" + ("=" * eq) + "]"
+    end = src.find(close, i + 1)
+
+    if end == -1:
+        return None
+
+    return end + len(close), src[i + 1:end]
+
+
+# ============================================================
+# TOKENIZER
+# ============================================================
+
+def tokenize_luau(src):
+    """
+    Conservative Luau tokenizer.
+
+    Tokens:
+      whitespace
+      comments
+      strings
+      longstrings
+      identifiers
+      numbers
+      operators
+      punctuation
+      other
+    """
+
+    tokens = []
+
+    i = 0
+    n = len(src)
+
+    while i < n:
+
+        c = src[i]
+
+        # ----------------------------------------------------
+        # whitespace
+        # ----------------------------------------------------
+
+        if c.isspace():
+            j = i + 1
+
+            while j < n and src[j].isspace():
+                j += 1
+
+            tokens.append(("ws", src[i:j]))
+            i = j
+            continue
+
+        # ----------------------------------------------------
+        # comments
+        # ----------------------------------------------------
+
+        if c == "-" and i + 1 < n and src[i + 1] == "-":
+
+            # long comment
+            long_result = read_long_bracket(src, i + 2)
+
+            if long_result:
+                end, _ = long_result
+                tokens.append(("comment", src[i:end]))
+                i = end
+                continue
+
+            # normal comment
+            j = i + 2
+
+            while j < n and src[j] not in "\r\n":
+                j += 1
+
+            tokens.append(("comment", src[i:j]))
+            i = j
+            continue
+
+        # ----------------------------------------------------
+        # quoted string
+        # ----------------------------------------------------
+
+        if c in ("'", '"'):
+
+            quote = c
+            j = i + 1
+
+            while j < n:
+
+                if src[j] == "\\":
+                    j += 2
+                    continue
+
+                if src[j] == quote:
+                    j += 1
+                    break
+
+                j += 1
+
+            tokens.append(("string", src[i:j]))
+            i = j
+            continue
+
+        # ----------------------------------------------------
+        # long string
+        # ----------------------------------------------------
+
+        if c == "[":
+
+            long_result = read_long_bracket(src, i)
+
+            if long_result:
+                end, _ = long_result
+                tokens.append(("longstring", src[i:end]))
+                i = end
+                continue
+
+        # ----------------------------------------------------
+        # identifier
+        # ----------------------------------------------------
+
+        if is_identifier_start(c):
+
+            j = i + 1
+
+            while j < n and is_identifier_char(src[j]):
+                j += 1
+
+            value = src[i:j]
+
+            if value in KEYWORDS:
+                tokens.append(("keyword", value))
+            else:
+                tokens.append(("identifier", value))
+
+            i = j
+            continue
+
+        # ----------------------------------------------------
+        # number
+        # ----------------------------------------------------
+
+        if c.isdigit() or (
+            c == "." and
+            i + 1 < n and
+            src[i + 1].isdigit()
+        ):
+
+            j = i
+
+            # hex
+            if src.startswith(("0x", "0X"), i):
+                j += 2
+
+                while j < n and (
+                    src[j].isdigit()
+                    or src[j].lower() in "abcdef"
+                    or src[j] == "_"
+                ):
+                    j += 1
+
+            else:
+                while j < n and (
+                    src[j].isalnum()
+                    or src[j] in "._+-"
+                ):
+                    # stop obvious operator sequence
+                    if src[j] in "+-" and j > i:
+                        prev = src[j - 1]
+
+                        if prev not in "eE":
+                            break
+
+                    j += 1
+
+            tokens.append(("number", src[i:j]))
+            i = j
+            continue
+
+        # ----------------------------------------------------
+        # operators
+        # ----------------------------------------------------
+
+        operators = (
+            "...",
+            "//",
+            "..",
+            "==",
+            "~=",
+            "<=",
+            ">=",
+            "::",
+            "+=",
+            "-=",
+            "*=",
+            "/=",
+            "%=",
+            "^=",
+            "..=",
+            "->",
+        )
+
+        found = None
+
+        for op in operators:
+            if src.startswith(op, i):
+                found = op
+                break
+
+        if found:
+            tokens.append(("operator", found))
+            i += len(found)
+            continue
+
+        # ----------------------------------------------------
+        # single char
+        # ----------------------------------------------------
+
+        tokens.append(("symbol", c))
+        i += 1
+
+    return tokens
+
+
+# ============================================================
+# COMMENT REMOVAL
+# ============================================================
+
+def remove_comments(tokens):
+    result = []
+
+    for kind, value in tokens:
+
+        if kind == "comment":
+            # Preserve newlines so line-related syntax remains sane.
+            newlines = value.count("\n")
+
+            if newlines:
+                result.append(("ws", "\n" * newlines))
+
+            continue
+
+        result.append((kind, value))
+
+    return result
+
+
+# ============================================================
+# STRING OBFUSCATION
+# ============================================================
+
+def obfuscate_strings(tokens):
+    result = []
+
+    runtime_name = random_name("_s")
+
+    # One shared decoder.
+    decoder = (
+        f"local {runtime_name}=function(_a)"
+        f"local _r={{}};"
+        f"for _i=1,#_a do "
+        f"_r[_i]=string.char(_a[_i]) "
+        f"end;"
+        f"return table.concat(_r)"
+        f"end;"
+    )
+
+    inserted = False
+
+    for kind, value in tokens:
+
+        if kind == "string":
+
+            decoded = decode_lua_string(value)
+
+            if decoded is None:
+                result.append((kind, value))
+                continue
+
+            # Empty strings are safe as-is.
+            if len(decoded) == 0:
+                result.append(("raw", '""'))
+                continue
+
+            numbers = ",".join(str(x) for x in decoded)
+
+            expression = f"{runtime_name}({{{numbers}}})"
+
+            result.append(("raw", expression))
+
+            inserted = True
+
+        else:
+            result.append((kind, value))
+
+    if inserted:
+        result.insert(0, ("raw", decoder))
+
+    return result
+
+
+# ============================================================
+# NUMBER OBFUSCATION
+# ============================================================
+
+SAFE_DECIMAL = re.compile(
+    r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$"
 )
 
 
-def collect_local_names(source):
-    names = set()
+def obfuscate_numbers(tokens):
+    result = []
 
-    # local x
-    for m in re.finditer(
-        r"\blocal\s+([A-Za-z_][A-Za-z0-9_]*)",
-        source
-    ):
-        names.add(m.group(1))
+    for kind, value in tokens:
 
-    # local a,b,c
-    for m in re.finditer(
-        r"\blocal\s+(.+?)(?:=|\n|;)",
-        source
-    ):
-        block = m.group(1)
+        if kind != "number":
+            result.append((kind, value))
+            continue
 
-        for x in re.findall(
-            r"[A-Za-z_][A-Za-z0-9_]*",
-            block
+        # Don't touch hex, scientific notation,
+        # malformed-looking literals, etc.
+        if not SAFE_DECIMAL.match(value):
+            result.append((kind, value))
+            continue
+
+        # Don't touch 0 / 1 in potentially sensitive contexts.
+        if value in ("0", "1"):
+            result.append((kind, value))
+            continue
+
+        try:
+            if "." in value:
+                number = float(value)
+
+                # Safe arithmetic expression.
+                a = secrets.randbelow(50) + 2
+                b = number - a
+
+                replacement = f"({a}+({b!r}))"
+
+            else:
+                number = int(value)
+
+                a = secrets.randbelow(1000) + 2
+                b = number - a
+
+                replacement = f"({a}+({b}))"
+
+            result.append(("raw", replacement))
+
+        except Exception:
+            result.append((kind, value))
+
+    return result
+
+
+# ============================================================
+# WHITESPACE MINIFIER
+# ============================================================
+
+def minify_tokens(tokens):
+    output = []
+
+    previous_kind = None
+    previous_value = ""
+
+    for kind, value in tokens:
+
+        if kind == "ws":
+
+            # Keep only necessary separation.
+            if not output:
+                continue
+
+            # Newline isn't required after comments because
+            # comments have already been removed.
+            continue
+
+        # Avoid joining identifiers together.
+        if (
+            output
+            and previous_kind in ("identifier", "keyword", "number")
+            and kind in ("identifier", "keyword", "number")
         ):
-            names.add(x)
+            output.append(" ")
 
-    # function foo(...)
-    for m in re.finditer(
-        r"\bfunction\s+[A-Za-z_][A-Za-z0-9_]*\s*\((.*?)\)",
-        source,
-        re.S
-    ):
-        args = m.group(1)
+        output.append(value)
 
-        for x in re.findall(
-            r"[A-Za-z_][A-Za-z0-9_]*",
-            args
-        ):
-            names.add(x)
+        previous_kind = kind
+        previous_value = value
 
-    # anonymous function arguments
-    for m in re.finditer(
-        r"\bfunction\s*\((.*?)\)",
-        source,
-        re.S
-    ):
-        args = m.group(1)
-
-        for x in re.findall(
-            r"[A-Za-z_][A-Za-z0-9_]*",
-            args
-        ):
-            names.add(x)
-
-    return names
+    return "".join(output)
 
 
-def rename_identifiers(source):
-    names = collect_local_names(source)
+# ============================================================
+# BASIC LOCAL RENAMING
+# ============================================================
+
+def rename_simple_locals(tokens):
+    """
+    Conservative local renaming.
+
+    This deliberately only renames simple declarations:
+
+        local foo = ...
+        local foo, bar = ...
+
+    and local function declarations:
+
+        local function foo(...)
+
+    It does NOT attempt dangerous global or member renaming.
+    """
 
     mapping = {}
 
-    for name in names:
-        if name in LUA_KEYWORDS:
-            continue
-
-        if name in PROTECTED_GLOBALS:
-            continue
-
-        if len(name) < 1:
-            continue
-
-        mapping[name] = rnd_name(
-            random.randint(8, 18)
-        )
-
-    if not mapping:
-        return source
-
-    # защищаем строки
-    strings = scan_strings(source)
-
-    def protected(pos):
-        for a, b, _ in strings:
-            if a <= pos < b:
-                return True
-        return False
-
-    matches = list(IDENT_RE.finditer(source))
-
-    replacements = []
-
-    for m in matches:
-        old = m.group(0)
-
-        if old not in mapping:
-            continue
-
-        if protected(m.start()):
-            continue
-
-        replacements.append(
-            (
-                m.start(),
-                m.end(),
-                mapping[old]
-            )
-        )
-
-    out = source
-
-    for a, b, replacement in reversed(replacements):
-        out = (
-            out[:a]
-            + replacement
-            + out[b:]
-        )
-
-    return out
-
-
-# ============================================================
-# COMMENT STRIPPING
-# ============================================================
-
-def strip_comments(source):
-    out = []
-    i = 0
-    n = len(source)
-
-    while i < n:
-        # strings
-        if source[i] in "\"'":
-            q = source[i]
-            start = i
-            i += 1
-            escaped = False
-
-            while i < n:
-                c = source[i]
-
-                if escaped:
-                    escaped = False
-                    i += 1
-                    continue
-
-                if c == "\\":
-                    escaped = True
-                    i += 1
-                    continue
-
-                if c == q:
-                    i += 1
-                    break
-
-                i += 1
-
-            out.append(source[start:i])
-            continue
-
-        # comment
-        if source.startswith("--", i):
-            if source.startswith("--[[", i):
-                end = source.find("]]", i + 4)
-
-                if end == -1:
-                    break
-
-                i = end + 2
-                out.append("\n")
-                continue
-
-            end = source.find("\n", i + 2)
-
-            if end == -1:
-                break
-
-            i = end
-            out.append("\n")
-            continue
-
-        out.append(source[i])
-        i += 1
-
-    return "".join(out)
-
-
-# ============================================================
-# WHITESPACE MINIFICATION
-# ============================================================
-
-def minify(source):
-    lines = source.splitlines()
-
     result = []
 
-    for line in lines:
-        x = line.strip()
+    i = 0
 
-        if not x:
+    while i < len(tokens):
+
+        kind, value = tokens[i]
+
+        # local declaration
+        if kind == "keyword" and value == "local":
+
+            result.append((kind, value))
+            i += 1
+
+            # local function name
+            if (
+                i + 1 < len(tokens)
+                and tokens[i][0] == "keyword"
+                and tokens[i][1] == "function"
+            ):
+                result.append(tokens[i])
+                i += 1
+
+                if i < len(tokens) and tokens[i][0] == "identifier":
+                    old = tokens[i][1]
+
+                    if old not in PROTECTED_NAMES:
+                        new = random_name("_l")
+                        mapping[old] = new
+                        result.append(("identifier", new))
+                    else:
+                        result.append(tokens[i])
+
+                    i += 1
+
+                continue
+
+            # regular local names
+            while i < len(tokens):
+
+                tk, tv = tokens[i]
+
+                if tk == "identifier":
+
+                    if tv not in PROTECTED_NAMES:
+                        if tv not in mapping:
+                            mapping[tv] = random_name("_l")
+
+                        result.append(("identifier", mapping[tv]))
+                    else:
+                        result.append(tokens[i])
+
+                    i += 1
+                    continue
+
+                # comma means another local variable
+                if tv == ",":
+                    result.append(tokens[i])
+                    i += 1
+                    continue
+
+                break
+
             continue
 
-        result.append(x)
+        result.append(tokens[i])
+        i += 1
 
-    return "\n".join(result)
+    # Apply only to identifiers outside protected names.
+    final = []
 
+    for kind, value in result:
 
-# ============================================================
-# JUNK CODE
-# ============================================================
+        if (
+            kind == "identifier"
+            and value in mapping
+        ):
+            final.append(("identifier", mapping[value]))
+        else:
+            final.append((kind, value))
 
-def junk_block():
-    a = rnd_name(10)
-    b = rnd_name(10)
-    c = random.randint(100, 999999)
-
-    return f"""
-do
-    local {a} = {c}
-    local {b} = ({a} * 3) - ({a} * 3)
-    if {b} ~= 0 then
-        {a} = {a} + {b}
-    end
-end
-"""
-
-
-def add_junk(source, amount=3):
-    blocks = []
-
-    for _ in range(amount):
-        blocks.append(
-            junk_block()
-        )
-
-    # вставляем сверху
-    return "\n".join(blocks) + "\n" + source
+    return final
 
 
 # ============================================================
-# HEADER
+# JUNK THAT DOES NOT AFFECT EXECUTION
 # ============================================================
 
-def obfuscation_header(level):
-    tag = "".join(
-        random.choice(
-            string.ascii_letters + string.digits
-        )
-        for _ in range(24)
-    )
-
-    return f"""--[[
-
-    Lua Obfuscator
-    Level: {level}
-    Build: {tag}
-
-    Generated automatically.
-
-]]--
-
-"""
-
-
-# ============================================================
-# VM-LIKE LAYER
-# ============================================================
-
-def vm_wrap(source):
+def add_safe_junk(source):
     """
-    Безопасный VM-подобный слой:
-    исходный код хранится в закодированном виде,
-    затем runtime декодирует его и передаёт load().
-    
-    Это НЕ полноценная виртуализация Lua bytecode.
+    Adds completely isolated local constants.
+
+    They are never used.
     """
 
-    key = random.randint(1, 255)
+    a = secrets.randbelow(9000) + 1000
+    b = secrets.randbelow(9000) + 1000
 
-    encoded = xor_bytes(
-        source.encode("utf-8"),
-        key
+    x = random_name("_j")
+    y = random_name("_j")
+
+    junk = (
+        f"local {x}={a};"
+        f"local {y}={b};"
     )
 
-    values = ",".join(
-        str(x)
-        for x in encoded
-    )
-
-    a = rnd_name(14)
-    b = rnd_name(14)
-    c = rnd_name(14)
-    d = rnd_name(14)
-    e = rnd_name(14)
-    f = rnd_name(14)
-
-    vm = f"""
-local {a}={key}
-local {b}={{{values}}}
-
-local function {c}({d})
-    local {e}={{}}
-    for {f}=1,#{d} do
-        {e}[{f}]=string.char({d}[{f}] ~ {a})
-    end
-    return table.concat({e})
-end
-
-local _chunk = {c}({b})
-local _fn, _err = load(_chunk)
-
-if not _fn then
-    error(_err)
-end
-
-return _fn()
-"""
-
-    return vm
+    return junk + source
 
 
 # ============================================================
-# EXTREME WRAPPER
+# OBFUSCATION MODES
 # ============================================================
 
-def extreme_wrap(source):
-    """
-    Дополнительный runtime-слой.
-    """
+def obfuscate(source, mode="MAX"):
 
-    key1 = random.randint(20, 230)
-    key2 = random.randint(20, 230)
+    if not source.strip():
+        raise ValueError("Пустой файл")
 
-    encoded = []
+    # --------------------------------------------------------
+    # Protect shebang / special first line
+    # --------------------------------------------------------
 
-    for b in source.encode("utf-8"):
-        x = b ^ key1
-        x = (x + key2) % 256
-        encoded.append(x)
+    shebang = ""
 
-    values = ",".join(
-        str(x)
-        for x in encoded
-    )
+    if source.startswith("#!"):
+        p = source.find("\n")
 
-    a = rnd_name(15)
-    b = rnd_name(15)
-    c = rnd_name(15)
-    d = rnd_name(15)
-    e = rnd_name(15)
+        if p != -1:
+            shebang = source[:p + 1]
+            source = source[p + 1:]
+        else:
+            shebang = source
+            source = ""
 
-    return f"""
-local {a}={key1}
-local {b}={key2}
-local {c}={{{values}}}
+    # --------------------------------------------------------
+    # Tokenize
+    # --------------------------------------------------------
 
-local function {d}(_x)
-    local _r={{}}
+    tokens = tokenize_luau(source)
 
-    for {e}=1,#{_x} do
-        _r[{e}]=string.char(
-            (((_x[{e}]-{b})%256)~{a})
-        )
-    end
+    # --------------------------------------------------------
+    # Remove comments
+    # --------------------------------------------------------
 
-    return table.concat(_r)
-end
+    tokens = remove_comments(tokens)
 
-local _source={d}({c})
-local _loader,_error=load(_source)
+    # --------------------------------------------------------
+    # Modes
+    # --------------------------------------------------------
 
-if not _loader then
-    error(_error)
-end
+    if mode == "SAFE":
 
-return _loader()
-"""
+        tokens = obfuscate_strings(tokens)
 
+    elif mode == "STRONG":
 
-# ============================================================
-# MAIN OBFUSCATOR
-# ============================================================
+        tokens = obfuscate_strings(tokens)
+        tokens = obfuscate_numbers(tokens)
 
-def obfuscate(source, level):
-    original = source
+    elif mode == "MAX":
 
-    # 1. remove comments
-    source = strip_comments(source)
+        tokens = obfuscate_strings(tokens)
+        tokens = obfuscate_numbers(tokens)
+        tokens = rename_simple_locals(tokens)
 
-    # 2. strings
-    if level in ("strong", "extreme", "vm"):
-        source = encrypt_strings(source)
+    else:
+        tokens = obfuscate_strings(tokens)
+        tokens = obfuscate_numbers(tokens)
+        tokens = rename_simple_locals(tokens)
 
-    # 3. numbers
-    if level in ("strong", "extreme", "vm"):
-        source = obfuscate_numbers(source)
+    # --------------------------------------------------------
+    # Generate
+    # --------------------------------------------------------
 
-    # 4. rename
-    if level in ("strong", "extreme", "vm"):
-        source = rename_identifiers(source)
+    result = minify_tokens(tokens)
 
-    # 5. junk
-    if level == "extreme":
-        source = add_junk(
-            source,
-            random.randint(3, 7)
-        )
+    # --------------------------------------------------------
+    # Safe junk only for MAX
+    # --------------------------------------------------------
 
-    # 6. minify
-    if level in ("strong", "extreme"):
-        source = minify(source)
+    if mode == "MAX":
+        result = add_safe_junk(result)
 
-    # 7. VM-like packaging
-    if level == "vm":
-        # Сначала готовим внутренний код,
-        # затем кодируем его целиком.
-        source = vm_wrap(source)
-
-    # 8. additional layer
-    if level == "extreme":
-        source = extreme_wrap(source)
-
-    header = obfuscation_header(level)
-
-    result = header + source
-
-    # если обфускация почему-то стала пустой
-    if len(result.strip()) < 30:
-        return original
-
-    return result
+    return shebang + result
 
 
 # ============================================================
 # TELEGRAM UI
 # ============================================================
 
-def levels_keyboard():
+def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "🟢 Basic",
-                callback_data="obf:basic"
-            ),
-            InlineKeyboardButton(
-                "🟡 Strong",
-                callback_data="obf:strong"
-            ),
+            InlineKeyboardButton("🟢 SAFE", callback_data="mode_SAFE"),
+            InlineKeyboardButton("🟡 STRONG", callback_data="mode_STRONG"),
         ],
         [
-            InlineKeyboardButton(
-                "🔴 Extreme",
-                callback_data="obf:extreme"
-            ),
-            InlineKeyboardButton(
-                "💀 VM",
-                callback_data="obf:vm"
-            ),
+            InlineKeyboardButton("🔴 MAX", callback_data="mode_MAX"),
         ],
-        [
-            InlineKeyboardButton(
-                "❌ Отмена",
-                callback_data="obf:cancel"
-            )
-        ]
     ])
 
 
-# ============================================================
-# /START
-# ============================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔐 Lua Obfuscator\n\n"
-        "Отправь мне файл .lua.\n\n"
-        "После загрузки можно выбрать уровень:\n\n"
-        "🟢 Basic — базовое скрытие\n"
-        "🟡 Strong — строки + числа + имена\n"
-        "🔴 Extreme — дополнительные слои\n"
-        "💀 VM — упаковка через runtime\n\n"
-        "Файл после обработки будет отправлен обратно."
-    )
-
-
-# ============================================================
-# DOCUMENT RECEIVER
-# ============================================================
-
-async def document_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    document = update.message.document
-
-    if not document:
-        return
-
-    filename = document.file_name or "input.lua"
-
-    if not filename.lower().endswith(".lua"):
-        await update.message.reply_text(
-            "❌ Нужен файл с расширением .lua"
-        )
-        return
-
-    if document.file_size and document.file_size > 2 * 1024 * 1024:
-        await update.message.reply_text(
-            "❌ Максимальный размер файла: 2 MB."
-        )
-        return
 
     user_id = update.effective_user.id
 
-    status = await update.message.reply_text(
-        "📥 Загружаю Lua-файл..."
+    USER_MODE[user_id] = "MAX"
+
+    text = (
+        "🔐 <b>Luau Obfuscator</b>\n\n"
+        "Загрузи сюда файл <code>.lua</code>.\n\n"
+        "<b>Режимы:</b>\n"
+        "🟢 SAFE — минимальные изменения\n"
+        "🟡 STRONG — строки + числа\n"
+        "🔴 MAX — максимальная консервативная обфускация\n\n"
+        "⚠️ VM/loadstring намеренно не используются: "
+        "главная цель — сохранить совместимость с Luau."
     )
 
-    try:
-        tg_file = await context.bot.get_file(
-            document.file_id
-        )
-
-        data = await tg_file.download_as_bytearray()
-
-        source = bytes(data).decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        if not source.strip():
-            await status.edit_text(
-                "❌ Файл пустой."
-            )
-            return
-
-        PENDING[user_id] = {
-            "filename": filename,
-            "source": source
-        }
-
-        await status.edit_text(
-            f"📄 Файл: `{filename}`\n"
-            f"📦 Размер: {len(data):,} байт\n\n"
-            "Выбери режим:",
-            parse_mode="Markdown",
-            reply_markup=levels_keyboard()
-        )
-
-    except Exception as e:
-        await status.edit_text(
-            f"❌ Ошибка загрузки:\n`{str(e)[:1000]}`",
-            parse_mode="Markdown"
-        )
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
 
 
-# ============================================================
-# BUTTON HANDLER
-# ============================================================
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
     query = update.callback_query
 
     await query.answer()
 
     user_id = query.from_user.id
 
-    if query.data == "obf:cancel":
-        PENDING.pop(user_id, None)
+    mode = query.data.replace("mode_", "")
 
-        await query.edit_message_text(
-            "❌ Обработка отменена."
-        )
-
+    if mode not in ("SAFE", "STRONG", "MAX"):
         return
 
-    if not query.data.startswith("obf:"):
-        return
+    USER_MODE[user_id] = mode
 
-    level = query.data.split(":", 1)[1]
-
-    if user_id not in PENDING:
-        await query.edit_message_text(
-            "❌ Файл не найден.\n"
-            "Отправь .lua заново."
-        )
-        return
-
-    item = PENDING[user_id]
-
-    source = item["source"]
-    filename = item["filename"]
-
-    level_names = {
-        "basic": "Basic",
-        "strong": "Strong",
-        "extreme": "Extreme",
-        "vm": "VM"
+    descriptions = {
+        "SAFE": "🟢 SAFE выбран",
+        "STRONG": "🟡 STRONG выбран",
+        "MAX": "🔴 MAX выбран",
     }
 
     await query.edit_message_text(
-        f"⚙️ Обрабатываю...\n\n"
-        f"Режим: {level_names.get(level, level)}"
+        descriptions[mode]
+        + "\n\nТеперь отправь файл `.lua`."
+    )
+
+
+# ============================================================
+# FILE PROCESSING
+# ============================================================
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    document = update.message.document
+
+    if not document:
+        return
+
+    filename = document.file_name or "script.lua"
+
+    if not filename.lower().endswith(".lua"):
+        await update.message.reply_text(
+            "❌ Нужен файл с расширением `.lua`."
+        )
+        return
+
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            "❌ Файл слишком большой. Максимум 5 MB."
+        )
+        return
+
+    user_id = update.effective_user.id
+
+    mode = USER_MODE.get(user_id, "MAX")
+
+    status = await update.message.reply_text(
+        f"⏳ Обфускация...\nРежим: {mode}"
     )
 
     try:
-        loop = asyncio.get_running_loop()
 
-        result = await loop.run_in_executor(
-            None,
-            obfuscate,
-            source,
-            level
-        )
+        telegram_file = await document.get_file()
 
-        # проверяем, что результат вообще существует
-        if not result.strip():
-            raise RuntimeError(
-                "Обфускатор вернул пустой результат"
-            )
+        buffer = io.BytesIO()
 
-        output_name = (
-            Path(filename).stem
-            + "_obfuscated.lua"
-        )
+        await telegram_file.download_to_memory(buffer)
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".lua",
-            delete=False,
-            encoding="utf-8"
-        ) as f:
-            f.write(result)
-            temp_path = f.name
+        buffer.seek(0)
 
-        original_size = len(
-            source.encode("utf-8")
-        )
+        raw = buffer.read()
 
-        result_size = len(
-            result.encode("utf-8")
-        )
-
-        await query.edit_message_text(
-            "✅ Обфускация завершена.\n\n"
-            f"Режим: {level_names.get(level, level)}\n"
-            f"Исходник: {original_size:,} байт\n"
-            f"Результат: {result_size:,} байт"
-        )
-
-        with open(temp_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=f,
-                filename=output_name,
-                caption=(
-                    "🔐 Готово!\n\n"
-                    f"Режим: {level_names.get(level, level)}\n"
-                    f"Файл: {output_name}"
-                )
-            )
+        # ----------------------------------------------------
+        # Decode source
+        # ----------------------------------------------------
 
         try:
-            os.remove(temp_path)
+            source = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            source = raw.decode("utf-8", errors="replace")
+
+        # ----------------------------------------------------
+        # Obfuscate
+        # ----------------------------------------------------
+
+        loop = asyncio.get_running_loop()
+
+        output = await loop.run_in_executor(
+            None,
+            lambda: obfuscate(source, mode),
+        )
+
+        # ----------------------------------------------------
+        # Prepare file
+        # ----------------------------------------------------
+
+        out = io.BytesIO(output.encode("utf-8"))
+
+        out.name = (
+            os.path.splitext(filename)[0]
+            + "_obf.lua"
+        )
+
+        out.seek(0)
+
+        await status.delete()
+
+        await update.message.reply_document(
+            document=out,
+            caption=(
+                "✅ <b>Готово</b>\n\n"
+                f"🔐 Режим: <b>{mode}</b>\n"
+                f"📄 Файл: <code>{out.name}</code>\n\n"
+                "Обфускация сделана без VM/loadstring."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        try:
+            await status.delete()
         except Exception:
             pass
 
-        PENDING.pop(user_id, None)
-
-    except Exception as e:
-        await query.edit_message_text(
-            "❌ Ошибка обфускации:\n\n"
-            f"{str(e)[:2000]}"
+        await update.message.reply_text(
+            "❌ Ошибка при обработке файла:\n"
+            f"<code>{str(e)[:1500]}</code>",
+            parse_mode="HTML",
         )
-
-        PENDING.pop(user_id, None)
 
 
 # ============================================================
 # TEXT HANDLER
 # ============================================================
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
-        "📁 Отправь Lua-файл документом.\n\n"
-        "Например:\n"
-        "`script.lua`",
-        parse_mode="Markdown"
+        "📄 Отправь именно файл `.lua`.\n\n"
+        "Перед этим можешь выбрать режим:",
+        reply_markup=main_keyboard(),
     )
 
 
 # ============================================================
-# BOT STARTUP
+# ERROR HANDLER
 # ============================================================
 
-def create_bot():
-    bot = (
+async def error_handler(update, context):
+
+    print("BOT ERROR:", repr(context.error))
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+def run_bot():
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    bot.add_handler(
-        CommandHandler(
-            "start",
-            start
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            mode_callback,
+            pattern=r"^mode_"
         )
     )
 
-    bot.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.Document.ALL,
-            document_handler
+            handle_document
         )
     )
 
-    bot.add_handler(
-        CallbackQueryHandler(
-            button_handler,
-            pattern=r"^obf:"
-        )
-    )
-
-    bot.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             text_handler
         )
     )
 
-    return bot
+    application.add_error_handler(error_handler)
 
+    print("Bot started")
 
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    # HTTP-сервер нужен Render/UptimeRobot
-    thread = threading.Thread(
-        target=run_web,
-        daemon=True
-    )
-
-    thread.start()
-
-    bot = create_bot()
-
-    print("================================")
-    print("Lua Obfuscator Bot")
-    print("HTTP server: ONLINE")
-    print("Telegram bot: STARTING")
-    print("================================")
-
-    bot.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+
+    threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    ).start()
+
+    run_bot()
